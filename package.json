@@ -1,0 +1,48 @@
+{
+  "name": "tokens-studio-mcp",
+  "version": "0.2.0",
+  "description": "CLI and MCP server that reads Tokens Studio applied tokens from a Figma URL. Returns a compact tree, a grouped token dictionary, or Figma-MCP-style XML.",
+  "keywords": [
+    "figma",
+    "tokens-studio",
+    "design-tokens",
+    "mcp",
+    "cli",
+    "claude-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Blyawon/tokensStudioMCP.git"
+  },
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "figtokens": "dist/index.js",
+    "tokens-studio-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "alias": "node scripts/setup-alias.mjs",
+    "setup": "npm install && npm run build && npm run alias && node dist/index.js setup"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.5"
+  }
+}
