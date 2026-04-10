@@ -201,6 +201,7 @@ Every CLI command accepts the same flag set. Grouped by intent:
 | `-n, --node 1:2` | Supply a node id when the URL doesn't have one |
 | `--layout` | Append `[x,y w×h]` to each line |
 | `--xml` | Emit legacy Figma-MCP-style XML instead of the compact tree |
+| `--json` | Emit a structured JSON object on stdout (tree, tokens, coverage, node) |
 | `--no-dedupe` | Don't collapse repeated sibling groups |
 
 Example:
@@ -208,6 +209,44 @@ Example:
 ```bash
 ft 'https://www.figma.com/design/abc/File?node-id=1-2' --depth 3 -o
 ```
+
+### `--json` output
+
+Every command that returns data (`ft`, `ft tree`, `ft tokens`, `ft
+coverage`, `ft node`) accepts `--json`. The object always has a
+`format` discriminator so one consumer can tell the shapes apart.
+
+```bash
+ft tokens 'https://www.figma.com/design/abc/File?node-id=1-2' --json
+```
+
+```json
+{
+  "format": "tokens",
+  "totalUnique": 47,
+  "totalProperties": 8,
+  "compositionHidden": 27,
+  "properties": {
+    "fill": {
+      "colors.brand.primary": [
+        { "name": "button", "type": "INSTANCE", "count": 4 },
+        { "name": "link", "type": "TEXT", "count": 2 }
+      ]
+    }
+  },
+  "gaps": [
+    { "name": "divider", "type": "LINE", "id": "1:27", "gaps": ["borderColor"] }
+  ]
+}
+```
+
+Tree JSON carries a `coverage` object and a nested `root` with
+`{ id, name, type, tokens?, gaps?, characters?, layout?, children? }`
+on every node. Coverage JSON is a plain
+`{ format: "coverage", withTokens, total, percent }`. Node JSON is a
+single-node snapshot with the display tokens inlined. None of them
+print the splash or summary divider — stdout stays clean for piping
+into `jq`, other scripts, or downstream codegen.
 
 ---
 

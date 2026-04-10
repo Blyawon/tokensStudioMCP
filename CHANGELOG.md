@@ -2,6 +2,59 @@
 
 All notable changes to `tokens-studio-mcp` / `ft`.
 
+## Unreleased
+
+### Added
+
+- **`--json` flag** on every data command (`ft`, `ft tree`,
+  `ft tokens`, `ft coverage`, `ft node`). Emits a structured object
+  on stdout with a `format` discriminator, so downstream consumers
+  can pipe into `jq`, a script, or a codegen pipeline without
+  parsing the ASCII tree. See the README section for the exact
+  shapes.
+- **`buildTreeJson`, `buildTokensJson`, `buildCoverageJson`,
+  `buildNodeJson`** helpers in `src/json-output.ts`. Respect the
+  same filters (`onlyWithTokens`, `onlyGaps`, `skipNode`,
+  `warnStyleGaps`, `includeComposition`) as the text renderers so
+  JSON output matches ASCII output on the same input.
+- **Gradient coverage bar.** `ft coverage` now colours the filled
+  portion by percentage — red below 30%, yellow in the mid range,
+  green from 60%, bright green when you hit the rare 85%+ mark.
+  Uses `▏▎▍▌▋▊▉` partial-block glyphs for sub-cell smoothing.
+- **Rotating splash taglines.** The `FT` block letters get one of
+  four random three-line taglines under them on every launch —
+  small touch of personality without any single line wearing out.
+- **Summary footer with divider** on `ft tree` and `ft tokens`.
+  Replaces the single-line `▸ file=…` footer with a thin horizontal
+  rule and `key=value` pairs. Skipped in `--json` mode so stdout
+  stays clean for piping.
+- **Setup stage markers.** `ft setup` now numbers its steps
+  `[1/3] … [2/3] … [3/3]` so you always know where you are.
+
+### Changed
+
+- **Friendlier error + edge-case copy.**
+  - Unknown command: `I don't have a \`xyz\` command. Try \`ft help\` for the list.`
+  - Clipboard empty: `Clipboard is empty. I checked twice. …`
+  - Clipboard has garbage: `Your clipboard has "…". That's not a Figma URL. (I would know.)`
+  - Coverage 0%: `Zero tokens applied. Either this frame is tokenless, or Tokens Studio hasn't touched it yet.`
+  - Coverage 100%: `Every node tokenized. Nothing to report, which is the best report.`
+  - Setup flow: plain-language prompts, stage markers, the
+    not-a-figd-token warning is now `Saving anyway — you'll know
+    soon enough.`
+- **Help text**: adds the `--json` flag row and keeps the single-screen
+  layout intact.
+
+### Tests
+
+- **`src/json-output.test.ts`** — 9 new tests covering tree nesting,
+  instance-path collapse, `onlyWithTokens` pruning, layout gating,
+  text character carry-through, token grouping, composition hidden
+  count, coverage rounding, and node snapshot with display tokens.
+  Suite total: **86 tests** (was 77).
+
+---
+
 ## 0.2.0
 
 A ground-up pass on CLI ergonomics, output size, and composition

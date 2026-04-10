@@ -15,6 +15,12 @@ import { renderMetadataXml, renderSingleNodeTokens } from "./xml.js";
 import { renderCompactTree, renderTokensList } from "./render-tree.js";
 import { makeSkipPredicate } from "./tokens.js";
 import {
+  buildCoverageJson,
+  buildNodeJson,
+  buildTokensJson,
+  buildTreeJson,
+} from "./json-output.js";
+import {
   DEFAULT_CONFIG,
   formatConfig,
   loadConfig,
@@ -22,7 +28,14 @@ import {
   type FtConfig,
   type LoadedConfig,
 } from "./config.js";
-import { c, progressBar, revealSplash, withSpinner } from "./cli-ui.js";
+import {
+  c,
+  coverageBar,
+  hr,
+  kv,
+  revealSplash,
+  withSpinner,
+} from "./cli-ui.js";
 
 // --------------------------------------------------------------------------
 // Project root + .env loader
@@ -131,6 +144,8 @@ interface CliFlags {
   layout: boolean;
   dedupe: boolean;
   format: "tree" | "xml";
+  /** `--json` — emit a structured JSON object on stdout instead of text. */
+  json: boolean;
   depth?: number;
   nodeOverride?: string;
   /** `--all` bypasses every config filter. */
@@ -149,6 +164,7 @@ function parseFlags(args: string[]): { input?: string; flags: CliFlags } {
     layout: false,
     dedupe: true,
     format: "tree",
+    json: false,
     all: false,
     withComponents: false,
     withVectors: false,
@@ -164,6 +180,7 @@ function parseFlags(args: string[]): { input?: string; flags: CliFlags } {
     else if (a === "--gaps" || a === "-g") flags.onlyGaps = true;
     else if (a === "--layout") flags.layout = true;
     else if (a === "--xml") flags.format = "xml";
+    else if (a === "--json") flags.json = true;
     else if (a === "--no-dedupe") flags.dedupe = false;
     else if (a === "--all") flags.all = true;
     else if (a === "--with-components") flags.withComponents = true;
@@ -269,15 +286,40 @@ function getLoadedConfig(): LoadedConfig {
 // --------------------------------------------------------------------------
 
 /**
- * Default `ft <url>` behaviour — the opinionated token dictionary with
- * gap warnings. Uses config filters (ignore components, ignore empty
- * vectors, strip composition tokens, surface style gaps).
+ * Pretty summary footer printed to stderr after every text command:
+ * a thin divider, then dim `key=value` pairs. Stderr on purpose so
+ * redirecting stdout (`ft ... > out.txt`) still gives you a clean file
+ * while you see the metadata in the terminal.
+ *
+ * Skipped in `--json` mode — JSON callers don't want stray text on
+ * stderr polluting their logs.
+ */
+function printSummary(
+  jsonMode: boolean,
+  target: { fileKey: string; nodeId?: string },
+  extras: Array<[string, string | number | undefined]> = []
+): void {
+  if (jsonMode) return;
+  process.stderr.write("\n" + hr() + "\n");
+  const pairs: Array<[string, string | number | undefined]> = [
+    ["file", target.fileKey],
+    ["node", target.nodeId],
+    ...extras,
+  ];
+  process.stderr.write(kv(pairs) + "\n");
+}
+
+/**
+ * `ft tokens <url>` — the opinionated token dictionary with gap warnings.
+ * Uses config filters (ignore components, ignore empty vectors, strip
+ * composition tokens, surface style gaps). Supports `--json` for a
+ * structured object.
  */
 async function cmdTokens(args: string[]): Promise<void> {
   const { input, flags } = parseFlags(args);
   if (!input) {
     console.error(
-      "usage: ft tokens <figma-url> [--with-composition] [--all] [--depth N]"
+      "usage: ft tokens <figma-url> [--json] [--with-composition] [--all] [--depth N]"
     );
     process.exit(1);
   }
@@ -288,29 +330,37 @@ async function cmdTokens(args: string[]): Promise<void> {
   const node = await loadNodeWithSpinner(client, target, flags.depth);
   const skipNode = makeSkipPredicate(config);
 
+  if (flags.json) {
+    const json = buildTokensJson(node, {
+      skipNode,
+      warnStyleGaps: config.warnStyleGaps,
+      includeComposition: config.includeComposition,
+    });
+    process.stdout.write(JSON.stringify(json, null, 2) + "\n");
+    return;
+  }
+
   const text = renderTokensList(node, {
     skipNode,
     warnStyleGaps: config.warnStyleGaps,
     includeComposition: config.includeComposition,
   });
   process.stdout.write(text + "\n");
-  console.error(
-    "\n" +
-      c.dim(
-        `▸ file=${target.fileKey}${target.nodeId ? " node=" + target.nodeId : ""}`
-      )
-  );
+  printSummary(false, target);
 }
 
 /**
- * Explicit `ft tree <url>` — the compact box-drawing tree (old default).
+ * Explicit `ft tree <url>` — the compact box-drawing tree (default).
  * Still respects config filters so the tree shows the same nodes the
- * token dictionary counted.
+ * token dictionary counted. Supports `--xml` and `--json`; `--json`
+ * wins over `--xml` if both are passed.
  */
 async function cmdTree(args: string[]): Promise<void> {
   const { input, flags } = parseFlags(args);
   if (!input) {
-    console.error("usage: ft tree <figma-url> [--xml] [--layout] [--no-dedupe] [--depth N]");
+    console.error(
+      "usage: ft tree <figma-url> [--xml] [--json] [--layout] [--no-dedupe] [--depth N]"
+    );
     process.exit(1);
   }
   maybeWarnAboutShellSplit(input);
@@ -319,6 +369,19 @@ async function cmdTree(args: string[]): Promise<void> {
   const client = getClient();
   const node = await loadNodeWithSpinner(client, target, flags.depth);
   const skipNode = makeSkipPredicate(config);
+
+  if (flags.json) {
+    const json = buildTreeJson(node, {
+      onlyWithTokens: config.onlyWithTokens,
+      onlyGaps: flags.onlyGaps,
+      layout: flags.layout,
+      warnStyleGaps: config.warnStyleGaps,
+      includeComposition: config.includeComposition,
+      skipNode,
+    });
+    process.stdout.write(JSON.stringify(json, null, 2) + "\n");
+    return;
+  }
 
   let withTokens: number;
   let total: number;
@@ -352,12 +415,10 @@ async function cmdTree(args: string[]): Promise<void> {
     gaps = result.gaps;
   }
 
-  const summary =
-    `▸ file=${target.fileKey}` +
-    (target.nodeId ? ` node=${target.nodeId}` : "") +
-    ` coverage=${withTokens}/${total}` +
-    (gaps > 0 ? ` untokenized=${gaps}` : "");
-  console.error("\n" + c.dim(summary));
+  printSummary(false, target, [
+    ["coverage", `${withTokens}/${total}`],
+    ["untokenized", gaps > 0 ? gaps : undefined],
+  ]);
 }
 
 function cmdConfig(): void {
@@ -371,10 +432,11 @@ function cmdConfig(): void {
 async function cmdNode(args: string[]): Promise<void> {
   const { input, flags } = parseFlags(args);
   if (!input) {
-    console.error("usage: ft node <figma-url-with-node-id>");
+    console.error("usage: ft node <figma-url-with-node-id> [--json]");
     process.exit(1);
   }
   maybeWarnAboutShellSplit(input);
+  const config = effectiveConfig(getLoadedConfig(), flags);
   const target = resolveTarget(input, flags);
   if (!target.nodeId) {
     throw new Error(
@@ -384,13 +446,20 @@ async function cmdNode(args: string[]): Promise<void> {
   }
   const client = getClient();
   const doc = await loadNodeWithSpinner(client, target, 1);
+  if (flags.json) {
+    const json = buildNodeJson(doc, {
+      includeComposition: config.includeComposition,
+    });
+    process.stdout.write(JSON.stringify(json, null, 2) + "\n");
+    return;
+  }
   process.stdout.write(renderSingleNodeTokens(doc) + "\n");
 }
 
 async function cmdCoverage(args: string[]): Promise<void> {
   const { input, flags } = parseFlags(args);
   if (!input) {
-    console.error("usage: ft coverage <figma-url> [--depth N]");
+    console.error("usage: ft coverage <figma-url> [--json] [--depth N]");
     process.exit(1);
   }
   maybeWarnAboutShellSplit(input);
@@ -400,22 +469,38 @@ async function cmdCoverage(args: string[]): Promise<void> {
   const node = await loadNodeWithSpinner(client, target, flags.depth);
   const skipNode = makeSkipPredicate(config);
   const result = renderMetadataXml(node, { onlyWithTokens: false, skipNode });
-  const pct = result.total === 0 ? 0 : Math.round((result.withTokens / result.total) * 100);
+  const pct =
+    result.total === 0 ? 0 : Math.round((result.withTokens / result.total) * 100);
+
+  if (flags.json) {
+    process.stdout.write(
+      JSON.stringify(buildCoverageJson(result.withTokens, result.total), null, 2) +
+        "\n"
+    );
+    return;
+  }
 
   if (process.stdout.isTTY) {
     console.log(
-      `${progressBar(pct, 20)} ${c.bold(`${result.withTokens} / ${result.total}`)}  ${c.dim(`(${pct}%)`)}`
+      `${coverageBar(pct, 24)} ${c.bold(`${result.withTokens} / ${result.total}`)}  ${c.dim(`(${pct}%)`)}`
     );
   } else {
     console.log(
       `${result.withTokens} / ${result.total} nodes have Tokens Studio tokens applied (${pct}%)`
     );
   }
+  // Personality flourishes for the two edge cases people actually care
+  // about — "it's empty" (did Tokens Studio even run on this file?) and
+  // "it's full" (celebrate good design hygiene).
   if (result.withTokens === 0) {
     console.log(
       c.yellow(
-        "No Tokens Studio data found in this subtree. Is Tokens Studio installed and applied in this file?"
+        "Zero tokens applied. Either this frame is tokenless, or Tokens Studio hasn't touched it yet."
       )
+    );
+  } else if (result.withTokens === result.total && result.total > 0) {
+    console.log(
+      c.green("Every node tokenized. Nothing to report, which is the best report.")
     );
   }
 }
@@ -423,44 +508,69 @@ async function cmdCoverage(args: string[]): Promise<void> {
 
 async function cmdSetup(): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const stage = (n: number, total: number) =>
+    c.dim(`[${n}/${total}]`) + " ";
   try {
     await revealSplash();
-    console.log(c.bold("Set up your Figma access token") + "\n");
-    console.log("1. Open this page and create a personal access token:");
-    console.log("   " + c.cyan("https://www.figma.com/developers/api#access-tokens"));
-    console.log("   " + c.dim("Scope needed: File content — Read-only.") + "\n");
+    console.log(c.bold("Let's get you a Figma token.") + "\n");
 
     const existing = process.env.FIGMA_API_KEY || process.env.FIGMA_TOKEN;
     if (existing) {
       const keep = await rl.question(
-        `A token is already saved (${existing.slice(0, 8)}…). Replace it? [y/N] `
+        `You already have a token on file (${existing.slice(0, 8)}…). Replace it? [y/N] `
       );
       if (keep.trim().toLowerCase() !== "y") {
-        console.log(c.green("✓") + " Keeping the existing token.");
+        console.log(
+          c.green("✓") + " Keeping the one you have. Nothing changed."
+        );
         return;
       }
     }
 
-    const token = (await rl.question("2. Paste your token (figd_…): ")).trim();
+    console.log(stage(1, 3) + "Open this page and create a personal access token:");
+    console.log(
+      "      " + c.cyan("https://www.figma.com/developers/api#access-tokens")
+    );
+    console.log("      " + c.dim("Scope: File content — Read-only.") + "\n");
+
+    const token = (
+      await rl.question(stage(2, 3) + "Paste your token (figd_…): ")
+    ).trim();
     if (!token) {
-      console.error(c.red("✗") + " No token entered. Run `ft setup` again when you have one.");
+      console.error(
+        c.red("✗") +
+          " No token entered. Run `ft setup` again when you have one."
+      );
       process.exit(1);
     }
     if (!token.startsWith("figd_")) {
       console.error(
         c.yellow(
-          `Heads up: Figma tokens usually start with "figd_". Yours starts with "${token.slice(0, 6)}". Saving anyway.`
+          `  Heads up: Figma tokens usually start with "figd_". Yours doesn't. Saving anyway — you'll know soon enough.`
         )
       );
     }
 
     writeFileSync(ENV_PATH, `FIGMA_API_KEY=${token}\n`, { mode: 0o600 });
-    console.log("\n" + c.green("✓") + ` Saved to ${c.dim(ENV_PATH)} (chmod 600).`);
-    console.log("\n" + c.bold("Try it out:"));
-    console.log(`  ${c.green("ft <figma-url>")}         ${c.dim("tree of a frame with applied tokens")}`);
-    console.log(`  ${c.green("ft tokens <figma-url>")}  ${c.dim("grouped token list + gap report")}`);
-    console.log(`  ${c.green("ft coverage <figma-url>")} ${c.dim("how much of the frame has tokens")}\n`);
-    console.log(c.dim("If `ft` isn't on your PATH yet, run:") + "  npm run alias");
+    console.log(
+      "\n" +
+        stage(3, 3) +
+        c.green("✓") +
+        ` Saved to ${c.dim(ENV_PATH)} ${c.dim("(chmod 600)")}.`
+    );
+    console.log("\n" + c.bold("Try it:"));
+    console.log(
+      `  ${c.green("ft <figma-url>")}          ${c.dim("tree of a frame with applied tokens")}`
+    );
+    console.log(
+      `  ${c.green("ft tokens <figma-url>")}   ${c.dim("grouped token list + gap report")}`
+    );
+    console.log(
+      `  ${c.green("ft coverage <figma-url>")} ${c.dim("how much of the frame has tokens")}\n`
+    );
+    console.log(
+      c.dim("If `ft` isn't on your PATH yet, run:") + "  " + c.green("npm run alias")
+    );
   } finally {
     rl.close();
   }
@@ -512,6 +622,7 @@ async function cmdHelp(): Promise<void> {
     flag("-n, --node 1:2", "use this node id instead of the URL's"),
     flag("    --layout", "add [x,y w×h] coordinates to each line"),
     flag("    --xml", "use the legacy XML format instead of the tree"),
+    flag("    --json", "emit a structured JSON object on stdout"),
     flag("    --no-dedupe", "don't collapse repeated sibling groups"),
     "",
     heading("Config"),
@@ -708,7 +819,7 @@ async function main() {
     const clipped = readClipboard();
     if (clipped.startsWith("http") && clipped.includes("figma.com")) {
       console.error(
-        `${c.green("▸")} ${c.dim("using URL from clipboard:")} ${c.cyan(clipped)}\n`
+        `${c.green("▸")} ${c.dim("grabbed URL from clipboard:")} ${c.cyan(clipped)}\n`
       );
       await cmdTree([clipped]);
       return;
@@ -718,12 +829,12 @@ async function main() {
       console.error(
         "\n" +
           c.yellow(
-            `Clipboard had "${clipped.slice(0, 60)}…" — that doesn't look like a Figma URL.`
+            `Your clipboard has "${clipped.slice(0, 60)}…". That's not a Figma URL. (I would know.)`
           )
       );
     } else {
       console.error(
-        "\n" + c.dim("Clipboard is empty. Copy a Figma URL first, or pass one as an argument.")
+        "\n" + c.dim("Clipboard is empty. I checked twice. Copy a Figma URL or pass one as an argument.")
       );
     }
     return;
@@ -766,7 +877,12 @@ async function main() {
         await cmdTree(args);
         return;
       }
-      console.error(c.red(`Unknown command: ${cmd}`) + "\n");
+      console.error(
+        c.red(`I don't have a \`${cmd}\` command.`) +
+          " " +
+          c.dim("Try `ft help` for the list.") +
+          "\n"
+      );
       await cmdHelp();
       process.exit(1);
   }
