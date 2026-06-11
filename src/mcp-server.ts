@@ -1358,9 +1358,14 @@ server.tool(
     "cornerRadius, opacity, and auto-layout props (layout='row'|'col', gap, " +
     "padding, justify/items = start|center|end|between, sizingHorizontal/" +
     "Vertical = HUG|FILL|FIXED). Text supports characters, fontSize, " +
-    "fontFamily, fontStyle. Returns the new node's id.",
+    "fontFamily, fontStyle. Pass `children` (array of nested create_node " +
+    "specs, same shape minus parentId) to build a WHOLE TREE in one call — " +
+    "e.g. a card frame with title + body + button. Also supports type='svg' " +
+    "({svg: markup}), 'image' ({base64}), 'section', and in FigJam files " +
+    "'sticky', 'connector' ({startNodeId,endNodeId}), 'shape'. Returns the " +
+    "new root node's id.",
   {
-    type: z.enum(["frame", "rectangle", "ellipse", "line", "text", "autolayout", "instance"]),
+    type: z.enum(["frame", "rectangle", "ellipse", "line", "text", "autolayout", "instance", "svg", "image", "section", "sticky", "connector", "shape"]),
     name: z.string().optional(),
     parentId: z.string().optional().describe("Append into this node instead of the page."),
     componentId: z.string().optional().describe("For type='instance'."),
@@ -1382,6 +1387,13 @@ server.tool(
     fontSize: z.number().optional(),
     fontFamily: z.string().optional(),
     fontStyle: z.string().optional(),
+    svg: z.string().optional().describe("SVG markup for type='svg'."),
+    base64: z.string().optional().describe("Base64 image bytes for type='image'."),
+    startNodeId: z.string().optional(),
+    endNodeId: z.string().optional(),
+    shapeType: z.string().optional(),
+    children: z.array(z.record(z.unknown())).optional()
+      .describe("Nested create_node specs (recursive). Child-only extras: sizingHorizontal/sizingVertical = HUG|FILL|FIXED."),
   },
   async (args) => {
     try {
@@ -1424,15 +1436,17 @@ server.tool(
     "selection): delete, clone (with offset), select (+scroll into view), " +
     "zoom, group, to-component (convert each node to a component), " +
     "combine-variants (promote frames to components and combine into a " +
-    "component set — name them 'Prop=Value' first), or append (move into " +
-    "parentId).",
+    "component set — name them 'Prop=Value' first), append (move into " +
+    "parentId), or arrange (grid-layout the targets with gap/columns).",
   {
-    action: z.enum(["delete", "clone", "select", "zoom", "group", "to-component", "combine-variants", "append"]),
+    action: z.enum(["delete", "clone", "select", "zoom", "group", "to-component", "combine-variants", "append", "arrange"]),
     nodeIds: z.array(z.string()).optional(),
     nodeId: z.string().optional(),
     name: z.string().optional().describe("Name for group / component set."),
     parentId: z.string().optional().describe("Target parent for 'append'."),
     offset: z.number().optional().describe("Clone offset in px (default 20)."),
+    gap: z.number().optional().describe("Grid gap for 'arrange' (default 40)."),
+    columns: z.number().int().positive().optional().describe("Grid columns for 'arrange'."),
   },
   async (args) => {
     try {
@@ -1523,10 +1537,12 @@ server.tool(
     "'createCollection' {name}, 'create' {name, collection, type: " +
     "COLOR|FLOAT|STRING|BOOLEAN, value}, 'setValue' {variableId, value, " +
     "modeId?}, 'bind' {variable (id or name), field: fill|stroke|" +
-    "cornerRadius|itemSpacing|paddingTop|…, nodeIds?/selection}. Colors " +
-    "accept hex/rgb()/hsl().",
+    "cornerRadius|itemSpacing|paddingTop|…, nodeIds?/selection}, " +
+    "'exportCss' / 'exportTailwind' {collection?} (CSS custom properties / " +
+    "Tailwind theme.colors from the file's variables). Colors accept " +
+    "hex/rgb()/hsl().",
   {
-    sub: z.enum(["listCollections", "list", "createCollection", "create", "setValue", "bind"]),
+    sub: z.enum(["listCollections", "list", "createCollection", "create", "setValue", "bind", "exportCss", "exportTailwind"]),
     name: z.string().optional(),
     collection: z.string().optional(),
     type: z.string().optional(),
@@ -1541,6 +1557,154 @@ server.tool(
   async (args) => {
     try {
       return jsonResult(await bridgeNodeOp("variables", args));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "create_icon",
+  "Create an icon on the canvas from the Iconify catalog (200k+ icons: " +
+    "lucide:*, mdi:*, tabler:*, heroicons:*, …). The server fetches the SVG " +
+    "from api.iconify.design and the plugin renders it as vectors, " +
+    "optionally tinted with `color` and placed inside `parentId`.",
+  {
+    icon: z.string().describe("Iconify id, e.g. 'lucide:home' or 'mdi:account'."),
+    size: z.number().positive().optional().describe("Width/height in px (default 24)."),
+    color: z.string().optional().describe("Tint color (hex/rgb()/hsl())."),
+    name: z.string().optional(),
+    parentId: z.string().optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+  },
+  async (args) => {
+    try {
+      const [prefix, ...rest] = args.icon.split(":");
+      const iconName = rest.join(":");
+      if (!prefix || !iconName) {
+        throw new Error("icon must be '<set>:<name>', e.g. 'lucide:home'.");
+      }
+      const size = args.size ?? 24;
+      const url = `https://api.iconify.design/${encodeURIComponent(prefix)}/${encodeURIComponent(iconName)}.svg?height=${size}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) throw new Error(`Iconify returned ${res.status} for '${args.icon}' — check the icon id.`);
+      const svg = await res.text();
+      if (!svg.includes("<svg")) throw new Error(`Iconify response for '${args.icon}' wasn't SVG (icon may not exist).`);
+      return jsonResult(await bridgeNodeOp("createNode", {
+        type: "svg",
+        svg,
+        fill: args.color,
+        name: args.name ?? args.icon,
+        parentId: args.parentId,
+        x: args.x,
+        y: args.y,
+        width: size,
+        height: size,
+      }));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "create_image_from_url",
+  "Fetch an image from a URL (server-side) and place it on the canvas as a " +
+    "rectangle with an image fill — e.g. reference screenshots, logos, " +
+    "photos. Native image size is used unless width/height given.",
+  {
+    url: z.string().describe("Direct image URL (png/jpg/gif/webp)."),
+    name: z.string().optional(),
+    width: z.number().positive().optional(),
+    height: z.number().positive().optional(),
+    parentId: z.string().optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+  },
+  async (args) => {
+    try {
+      const res = await fetch(args.url, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`Image fetch failed: ${res.status} ${res.statusText} for ${args.url}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+      if (buf.length > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is ${(buf.length / 1024 / 1024).toFixed(1)} MB — over the 8 MB limit for the plugin bridge.`);
+      }
+      return jsonResult(await bridgeNodeOp("createNode", {
+        type: "image",
+        base64: buf.toString("base64"),
+        name: args.name ?? args.url.split("/").pop()?.split("?")[0] ?? "Image",
+        parentId: args.parentId,
+        x: args.x,
+        y: args.y,
+        width: args.width,
+        height: args.height,
+      }, 180_000));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "canvas_audit",
+  "Accessibility audit of the live canvas via the plugin (scope: nodeId → " +
+    "selection → current page). Checks: 'contrast' (WCAG AA/AAA text-vs-" +
+    "background ratios, large-text aware), 'touch' (interactive elements " +
+    "≥44×44, detected by reactions or button/input-ish names), 'text' " +
+    "(minimum font size), or 'all'. Returns per-check counts + failing " +
+    "nodes with ids so fixes can target them directly.",
+  {
+    check: z.enum(["contrast", "touch", "text", "all"]).optional(),
+    nodeId: z.string().optional(),
+    level: z.enum(["AA", "AAA"]).optional(),
+    minTouch: z.number().positive().optional(),
+    minFontSize: z.number().positive().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("a11y", { ...args, check: args.check ?? "all" }, 300_000));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "analyze_design",
+  "Usage statistics for the live canvas via the plugin (scope: nodeId → " +
+    "selection → current page): top solid fill colors, top typography " +
+    "combos (family/style/size), and top auto-layout gaps + paddings, each " +
+    "with usage counts. Use it to spot hard-coded values that should be " +
+    "tokens, or to derive a palette from an existing design.",
+  {
+    kind: z.enum(["colors", "typography", "spacing", "all"]).optional(),
+    nodeId: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("analyze", { ...args, kind: args.kind ?? "all" }, 300_000));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "dev_resources",
+  "Manage dev resources (links to Storybook / GitHub / docs) on a node via " +
+    "the plugin: action='add' {url, name?}, 'list', or 'delete' {url}. " +
+    "Targets nodeId or the current selection.",
+  {
+    action: z.enum(["add", "list", "delete"]).optional(),
+    nodeId: z.string().optional(),
+    url: z.string().optional(),
+    name: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("devResources", { ...args, action: args.action ?? "list" }));
     } catch (err) {
       return toolError(err);
     }

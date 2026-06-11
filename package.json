@@ -1,6 +1,6 @@
 {
   "name": "tokens-studio-mcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "CLI and MCP server that reads Tokens Studio applied tokens from a Figma URL. Returns a compact tree, a grouped token dictionary, or Figma-MCP-style XML.",
   "keywords": [
     "figma",

@@ -42,7 +42,7 @@ npm run dev            # tsx hot-reload (CLI)
 |------|---------|
 | `index.ts` | Entry point: .env loading, CLI router, clipboard |
 | `cli-commands.ts` | All CLI subcommands (tree, tokens, coverage, node, config, setup, help) |
-| `mcp-server.ts` | MCP server + all 33 tool registrations + bridge handlers |
+| `mcp-server.ts` | MCP server + all 38 tool registrations + bridge handlers |
 | `design-context.ts` | Markdown design-context renderer (layout + visual + typography + tokens per node) |
 | `apply-theme.ts` | Theme orchestration: catalog → resolve → write dispatch |
 | `apply-remap.ts` | Token remap + variant bulk-apply |
@@ -119,11 +119,15 @@ npm run dev            # tsx hot-reload (CLI)
 
 The bridge exposes two generic plugin methods — `evalCode` (arbitrary JS in
 the sandbox) and `nodeOp` (structured op dispatcher) — surfaced as MCP tools:
-`figma_eval`, `create_node`, `set_node_properties`, `node_action`,
-`get_canvas_tree`, `find_nodes`, `export_node_image`, `figma_variables`.
-These operate on whatever file the plugin is open in (any tab, drafts
-included) — no REST key or fileKey needed. Adding a new structured op =
-one `case` in `node-ops.ts:opNodeOp`; no protocol change.
+`figma_eval`, `create_node` (recursive `children` builds whole trees),
+`set_node_properties`, `node_action`, `get_canvas_tree`, `find_nodes`,
+`export_node_image`, `figma_variables` (incl. exportCss/exportTailwind),
+`create_icon` (Iconify), `create_image_from_url`, `canvas_audit` (WCAG
+contrast/touch/text), `analyze_design` (color/typography/spacing usage),
+`dev_resources`. FigJam files get `sticky` / `connector` / `shape` node
+types. These operate on whatever file the plugin is open in (any tab,
+drafts included) — no REST key or fileKey needed. Adding a new structured
+op = one `case` in `node-ops.ts:opNodeOp`; no protocol change.
 
 ## Agent-facing Output
 

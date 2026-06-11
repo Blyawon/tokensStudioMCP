@@ -31,8 +31,11 @@ export async function opNodeOp(params: unknown): Promise<unknown> {
     case "findNodes": return findNodes(args);
     case "exportNode": return exportNode(args);
     case "variables": return variablesOp(args);
+    case "a11y": return a11yOp(args);
+    case "analyze": return analyzeOp(args);
+    case "devResources": return devResourcesOp(args);
     default:
-      throw new Error(`Unknown nodeOp '${String(p.op)}'. Supported: createNode, setNodeProps, nodeAction, getNodeTree, findNodes, exportNode, variables.`);
+      throw new Error(`Unknown nodeOp '${String(p.op)}'. Supported: createNode, setNodeProps, nodeAction, getNodeTree, findNodes, exportNode, variables, a11y, analyze, devResources.`);
   }
 }
 
@@ -41,6 +44,34 @@ export async function opNodeOp(params: unknown): Promise<unknown> {
 // ---------------------------------------------------------------------------
 
 async function createNode(args: Record<string, unknown>): Promise<unknown> {
+  // Parent: explicit parentId, else current page.
+  let parent: BaseNode & ChildrenMixin = figma.currentPage;
+  if (typeof args.parentId === "string" && args.parentId) {
+    const candidate = await figma.getNodeByIdAsync(args.parentId);
+    if (!candidate || !("appendChild" in candidate)) throw new Error(`parentId '${args.parentId}' not found or can't hold children`);
+    parent = candidate as BaseNode & ChildrenMixin;
+  }
+
+  const node = await createOne(args, parent, true);
+
+  if (args.select !== false && parent.type === "PAGE") {
+    figma.currentPage.selection = [node];
+  }
+  figma.commitUndo();
+  return { id: node.id, name: node.name, type: node.type, x: node.x, y: node.y, width: (node as FrameNode).width, height: (node as FrameNode).height };
+}
+
+/**
+ * Build one node (plus its `children` specs, recursively). This is the
+ * figma-cli "render JSX" equivalent: one call constructs a whole tree —
+ * fonts loaded per text node, auto-layout props applied parent-first so
+ * child HUG/FILL sizing works.
+ */
+async function createOne(
+  args: Record<string, unknown>,
+  parent: BaseNode & ChildrenMixin,
+  isRoot: boolean
+): Promise<SceneNode> {
   const type = String(args.type ?? "frame").toLowerCase();
   let node: SceneNode;
 
@@ -78,38 +109,114 @@ async function createNode(args: Record<string, unknown>): Promise<unknown> {
       node = (comp as ComponentNode).createInstance();
       break;
     }
+    case "svg": {
+      const svg = String(args.svg ?? "");
+      if (!svg.includes("<svg")) throw new Error("type='svg' needs { svg: '<svg …>' } markup");
+      node = figma.createNodeFromSvg(svg);
+      // Recolor every vector fill when a color is given (icon tinting).
+      if (args.fill != null && args.fill !== "none") {
+        const paint = solidPaint(String(args.fill));
+        const tint = (n: SceneNode): void => {
+          if ("fills" in n && Array.isArray((n as GeometryMixin).fills) && ((n as GeometryMixin).fills as readonly Paint[]).length > 0) {
+            (n as GeometryMixin).fills = [paint];
+          }
+          if ("children" in n) for (const c of (n as ChildrenMixin).children) tint(c as SceneNode);
+        };
+        tint(node);
+      }
+      break;
+    }
+    case "image": {
+      const base64 = String(args.base64 ?? "");
+      if (!base64) throw new Error("type='image' needs { base64 } (raw image bytes, base64-encoded)");
+      const image = figma.createImage(figma.base64Decode(base64));
+      const { width, height } = await image.getSizeAsync();
+      const rect = figma.createRectangle();
+      rect.resize(
+        args.width != null ? Number(args.width) : width,
+        args.height != null ? Number(args.height) : height
+      );
+      rect.fills = [{ type: "IMAGE", scaleMode: "FILL", imageHash: image.hash }];
+      node = rect;
+      break;
+    }
+    case "section": {
+      const section = figma.createSection();
+      node = section as unknown as SceneNode;
+      break;
+    }
+    case "sticky": {
+      requireFigJam("sticky");
+      const sticky = figma.createSticky();
+      await figma.loadFontAsync(sticky.text.fontName as FontName);
+      sticky.text.characters = String(args.characters ?? args.text ?? "");
+      node = sticky as unknown as SceneNode;
+      break;
+    }
+    case "connector": {
+      requireFigJam("connector");
+      const connector = figma.createConnector();
+      const startId = String(args.startNodeId ?? "");
+      const endId = String(args.endNodeId ?? "");
+      if (startId) connector.connectorStart = { endpointNodeId: startId, magnet: "AUTO" };
+      if (endId) connector.connectorEnd = { endpointNodeId: endId, magnet: "AUTO" };
+      node = connector as unknown as SceneNode;
+      break;
+    }
+    case "shape": {
+      requireFigJam("shape");
+      const shape = figma.createShapeWithText();
+      const shapeType = String(args.shapeType ?? "ROUNDED_RECTANGLE").toUpperCase();
+      shape.shapeType = shapeType as ShapeWithTextNode["shapeType"];
+      if (args.characters != null || args.text != null) {
+        await figma.loadFontAsync(shape.text.fontName as FontName);
+        shape.text.characters = String(args.characters ?? args.text ?? "");
+      }
+      node = shape as unknown as SceneNode;
+      break;
+    }
     default:
       throw new Error(`Unsupported createNode type '${type}'`);
   }
 
-  // Parent: explicit parentId, else current page.
-  let parent: BaseNode & ChildrenMixin = figma.currentPage;
-  if (typeof args.parentId === "string" && args.parentId) {
-    const candidate = await figma.getNodeByIdAsync(args.parentId);
-    if (!candidate || !("appendChild" in candidate)) throw new Error(`parentId '${args.parentId}' not found or can't hold children`);
-    parent = candidate as BaseNode & ChildrenMixin;
-  }
   parent.appendChild(node);
 
-  // Geometry. Without explicit x, auto-position right of existing content
-  // so new nodes never stack at 0,0 (figma-cli "smart positioning").
+  // Geometry. Without explicit x, top-level nodes auto-position right of
+  // existing content so they never stack at 0,0 (figma-cli "smart position").
   const w = args.width != null ? Number(args.width) : undefined;
   const h = args.height != null ? Number(args.height) : undefined;
-  if ("resize" in node && (w != null || h != null)) {
+  if ("resize" in node && (w != null || h != null) && type !== "image") {
     (node as FrameNode).resize(w ?? (node as FrameNode).width, h ?? (node as FrameNode).height);
   }
   if (args.x != null) node.x = Number(args.x);
-  else if (parent.type === "PAGE") node.x = nextFreeX(parent as PageNode);
+  else if (isRoot && parent.type === "PAGE") node.x = nextFreeX(parent as PageNode);
   if (args.y != null) node.y = Number(args.y);
 
   if (typeof args.name === "string" && args.name) node.name = args.name;
   applySharedProps(node, args);
 
-  if (args.select !== false && parent.type === "PAGE") {
-    figma.currentPage.selection = [node];
+  // Recursive children — applied AFTER this node's auto-layout props so
+  // child HUG/FILL sizing resolves against a live auto-layout parent.
+  if (Array.isArray(args.children) && "appendChild" in node) {
+    for (const childSpec of args.children as Array<Record<string, unknown>>) {
+      const child = await createOne(childSpec ?? {}, node as BaseNode & ChildrenMixin, false);
+      // Child-side sizing props need the child to already be parented.
+      if (childSpec.sizingHorizontal != null && "layoutSizingHorizontal" in child) {
+        (child as unknown as Record<string, unknown>).layoutSizingHorizontal = String(childSpec.sizingHorizontal).toUpperCase();
+      }
+      if (childSpec.sizingVertical != null && "layoutSizingVertical" in child) {
+        (child as unknown as Record<string, unknown>).layoutSizingVertical = String(childSpec.sizingVertical).toUpperCase();
+      }
+    }
   }
-  figma.commitUndo();
-  return { id: node.id, name: node.name, type: node.type, x: node.x, y: node.y, width: (node as FrameNode).width, height: (node as FrameNode).height };
+
+  return node;
+}
+
+function requireFigJam(what: string): void {
+  if (figma.editorType !== "figjam") {
+    throw new Error(`'${what}' nodes need a FigJam file (this plugin is open in a ${figma.editorType} file).`);
+  }
 }
 
 function nextFreeX(page: PageNode): number {
@@ -325,8 +432,23 @@ async function nodeAction(args: Record<string, unknown>): Promise<unknown> {
       figma.commitUndo();
       return { ok: true, moved: nodes.map((n) => n.id), parent: parent.id };
     }
+    case "arrange": {
+      // Grid-arrange (figma-cli `arrange`): row-major, equal gap.
+      const gap = args.gap != null ? Number(args.gap) : 40;
+      const columns = args.columns != null ? Math.max(1, Number(args.columns)) : Math.ceil(Math.sqrt(nodes.length));
+      const startX = Math.min(...nodes.map((n) => n.x));
+      const startY = Math.min(...nodes.map((n) => n.y));
+      const colWidth = Math.max(...nodes.map((n) => n.width));
+      const rowHeight = Math.max(...nodes.map((n) => n.height));
+      nodes.forEach((n, i) => {
+        n.x = startX + (i % columns) * (colWidth + gap);
+        n.y = startY + Math.floor(i / columns) * (rowHeight + gap);
+      });
+      figma.commitUndo();
+      return { ok: true, arranged: nodes.length, columns, gap };
+    }
     default:
-      throw new Error(`Unknown action '${action}'. Supported: delete, clone, select, zoom, group, to-component, combine-variants, append.`);
+      throw new Error(`Unknown action '${action}'. Supported: delete, clone, select, zoom, group, to-component, combine-variants, append, arrange.`);
   }
 }
 
@@ -515,9 +637,253 @@ async function variablesOp(args: Record<string, unknown>): Promise<unknown> {
       figma.commitUndo();
       return { ok: true, bound, variable: variable.name, field };
     }
+    case "exportCss":
+    case "exportTailwind": {
+      const all = await vars.getLocalVariablesAsync();
+      const collectionFilter = typeof args.collection === "string" ? args.collection : null;
+      const cols = await vars.getLocalVariableCollectionsAsync();
+      const wanted = collectionFilter
+        ? cols.find((c) => c.id === collectionFilter || c.name === collectionFilter)
+        : null;
+      const filtered = wanted ? all.filter((v) => v.variableCollectionId === wanted.id) : all;
+      const hexOf = (val: unknown): string | null => {
+        const c = val as { r?: number; g?: number; b?: number };
+        if (typeof c?.r !== "number") return null;
+        return rgbToHex({ r: c.r, g: c.g!, b: c.b! });
+      };
+      if (sub === "exportCss") {
+        const lines = filtered.map((v) => {
+          const val = Object.values(v.valuesByMode)[0];
+          const css = v.resolvedType === "COLOR" ? hexOf(val)
+            : v.resolvedType === "FLOAT" ? `${String(val)}px`
+            : String(val);
+          return `  --${v.name.replace(/[/.]/g, "-")}: ${css ?? String(val)};`;
+        });
+        return { css: `:root {\n${lines.join("\n")}\n}`, count: filtered.length };
+      }
+      const colors: Record<string, unknown> = {};
+      for (const v of filtered) {
+        if (v.resolvedType !== "COLOR") continue;
+        const hex = hexOf(Object.values(v.valuesByMode)[0]);
+        if (!hex) continue;
+        const parts = v.name.split("/");
+        if (parts.length === 2) {
+          const group = (colors[parts[0]] ??= {}) as Record<string, string>;
+          group[parts[1]] = hex;
+        } else {
+          colors[v.name.replace(/\//g, "-")] = hex;
+        }
+      }
+      return { tailwind: { theme: { extend: { colors } } }, count: Object.keys(colors).length };
+    }
     default:
-      throw new Error(`Unknown variables sub-op '${sub}'. Supported: listCollections, list, createCollection, create, setValue, bind.`);
+      throw new Error(`Unknown variables sub-op '${sub}'. Supported: listCollections, list, createCollection, create, setValue, bind, exportCss, exportTailwind.`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// a11y — WCAG contrast / touch target / text size audit (figma-cli `a11y`)
+// ---------------------------------------------------------------------------
+
+async function a11yOp(args: Record<string, unknown>): Promise<unknown> {
+  const check = String(args.check ?? "all");
+  const root = await resolveScopeRoot(args);
+  const level = String(args.level ?? "AA").toUpperCase();
+  const minTouch = args.minTouch != null ? Number(args.minTouch) : 44;
+  const minFontSize = args.minFontSize != null ? Number(args.minFontSize) : 12;
+
+  const texts: TextNode[] = [];
+  const interactive: SceneNode[] = [];
+  const walk = (n: BaseNode): void => {
+    if ("visible" in n && (n as SceneNode).visible === false) return;
+    if (n.type === "TEXT") texts.push(n as TextNode);
+    const scene = n as SceneNode;
+    if (
+      "reactions" in scene && Array.isArray((scene as FrameNode).reactions) && (scene as FrameNode).reactions.length > 0
+    ) {
+      interactive.push(scene);
+    } else if (/\b(button|btn|link|input|checkbox|switch|tab|chip|icon-?button)\b/i.test(n.name)) {
+      if ("width" in scene) interactive.push(scene);
+    }
+    if ("children" in n) for (const c of (n as ChildrenMixin).children) walk(c);
+  };
+  walk(root);
+
+  const out: Record<string, unknown> = { scope: { id: root.id, name: root.name }, level };
+
+  if (check === "contrast" || check === "all") {
+    const issues: Array<Record<string, unknown>> = [];
+    let checked = 0;
+    for (const t of texts) {
+      const fg = firstSolidRGB(t.fills);
+      if (!fg) continue;
+      const bg = findBackgroundRGB(t);
+      if (!bg) continue;
+      checked++;
+      const ratio = contrastRatio(fg, bg);
+      const fontSize = typeof t.fontSize === "number" ? t.fontSize : 16;
+      const weight = typeof t.fontWeight === "number" ? t.fontWeight : 400;
+      const isLarge = fontSize >= 24 || (fontSize >= 18.66 && weight >= 700);
+      const required = level === "AAA" ? (isLarge ? 4.5 : 7) : (isLarge ? 3 : 4.5);
+      if (ratio < required) {
+        issues.push({
+          id: t.id, name: t.name, text: t.characters.slice(0, 40),
+          fontSize, ratio: Math.round(ratio * 100) / 100, required,
+          fg: rgbToHex(fg), bg: rgbToHex(bg),
+        });
+      }
+    }
+    out.contrast = { checked, failing: issues.length, issues: issues.slice(0, 50) };
+  }
+
+  if (check === "touch" || check === "all") {
+    const issues = interactive
+      .filter((n) => "width" in n && (n.width < minTouch || n.height < minTouch))
+      .map((n) => ({ id: n.id, name: n.name, type: n.type, width: Math.round(n.width), height: Math.round(n.height) }));
+    out.touch = { minSize: minTouch, checked: interactive.length, failing: issues.length, issues: issues.slice(0, 50) };
+  }
+
+  if (check === "text" || check === "all") {
+    const issues = texts
+      .filter((t) => typeof t.fontSize === "number" && t.fontSize < minFontSize)
+      .map((t) => ({ id: t.id, name: t.name, fontSize: t.fontSize, text: t.characters.slice(0, 40) }));
+    out.text = { minSize: minFontSize, checked: texts.length, failing: issues.length, issues: issues.slice(0, 50) };
+  }
+
+  return out;
+}
+
+function firstSolidRGB(paints: unknown): RGB | null {
+  if (!Array.isArray(paints)) return null;
+  for (const p of paints as Paint[]) {
+    if (p.type === "SOLID" && p.visible !== false) return (p as SolidPaint).color;
+  }
+  return null;
+}
+
+/** Walk up parents to the nearest visible solid fill — the effective background. */
+function findBackgroundRGB(node: BaseNode): RGB | null {
+  let cur: BaseNode | null = node.parent;
+  while (cur && cur.type !== "PAGE" && cur.type !== "DOCUMENT") {
+    if ("fills" in cur) {
+      const rgb = firstSolidRGB((cur as GeometryMixin).fills);
+      if (rgb) return rgb;
+    }
+    cur = cur.parent;
+  }
+  return null;
+}
+
+function relativeLuminance(c: RGB): number {
+  const lin = (v: number) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+  return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+
+function contrastRatio(a: RGB, b: RGB): number {
+  const l1 = relativeLuminance(a);
+  const l2 = relativeLuminance(b);
+  return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+}
+
+function rgbToHex(c: RGB): string {
+  const to = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, "0");
+  return `#${to(c.r)}${to(c.g)}${to(c.b)}`;
+}
+
+// ---------------------------------------------------------------------------
+// analyze — usage stats for colors / typography / spacing (figma-cli `analyze`)
+// ---------------------------------------------------------------------------
+
+async function analyzeOp(args: Record<string, unknown>): Promise<unknown> {
+  const kind = String(args.kind ?? "all");
+  const root = await resolveScopeRoot(args);
+
+  const colorCounts = new Map<string, number>();
+  const typoCounts = new Map<string, number>();
+  const gapCounts = new Map<number, number>();
+  const padCounts = new Map<number, number>();
+
+  const walk = (n: BaseNode): void => {
+    if ("visible" in n && (n as SceneNode).visible === false) return;
+    if ("fills" in n && Array.isArray((n as GeometryMixin).fills)) {
+      for (const p of (n as GeometryMixin).fills as readonly Paint[]) {
+        if (p.type === "SOLID" && p.visible !== false) {
+          const hex = rgbToHex((p as SolidPaint).color);
+          colorCounts.set(hex, (colorCounts.get(hex) ?? 0) + 1);
+        }
+      }
+    }
+    if (n.type === "TEXT") {
+      const t = n as TextNode;
+      const font = typeof t.fontName === "object" ? (t.fontName as FontName) : null;
+      const size = typeof t.fontSize === "number" ? t.fontSize : null;
+      if (font && size != null) {
+        const key = `${font.family}/${font.style}/${size}`;
+        typoCounts.set(key, (typoCounts.get(key) ?? 0) + 1);
+      }
+    }
+    const f = n as FrameNode;
+    if ("layoutMode" in f && f.layoutMode !== "NONE") {
+      gapCounts.set(f.itemSpacing, (gapCounts.get(f.itemSpacing) ?? 0) + 1);
+      for (const pad of [f.paddingTop, f.paddingRight, f.paddingBottom, f.paddingLeft]) {
+        if (pad > 0) padCounts.set(pad, (padCounts.get(pad) ?? 0) + 1);
+      }
+    }
+    if ("children" in n) for (const c of (n as ChildrenMixin).children) walk(c);
+  };
+  walk(root);
+
+  const top = <K>(m: Map<K, number>, n: number) =>
+    Array.from(m.entries()).sort((a, b) => b[1] - a[1]).slice(0, n)
+      .map(([value, count]) => ({ value, count }));
+
+  const out: Record<string, unknown> = { scope: { id: root.id, name: root.name } };
+  if (kind === "colors" || kind === "all") out.colors = top(colorCounts, 20);
+  if (kind === "typography" || kind === "all") out.typography = top(typoCounts, 15);
+  if (kind === "spacing" || kind === "all") out.spacing = { gaps: top(gapCounts, 10), paddings: top(padCounts, 10) };
+  return out;
+}
+
+/** Common scope resolution for audits: nodeId → selection → current page. */
+async function resolveScopeRoot(args: Record<string, unknown>): Promise<BaseNode> {
+  if (typeof args.nodeId === "string" && args.nodeId) {
+    const n = await figma.getNodeByIdAsync(args.nodeId);
+    if (!n) throw new Error(`Node '${args.nodeId}' not found`);
+    return n;
+  }
+  if (figma.currentPage.selection.length === 1) return figma.currentPage.selection[0];
+  return figma.currentPage;
+}
+
+// ---------------------------------------------------------------------------
+// devResources — link nodes to Storybook / GitHub / docs (figma-cli `dev`)
+// ---------------------------------------------------------------------------
+
+async function devResourcesOp(args: Record<string, unknown>): Promise<unknown> {
+  const action = String(args.action ?? "list");
+  const ids = await resolveTargetIds(args);
+  if (ids.length === 0) throw new Error("devResources needs a nodeId or selection.");
+  const node = await figma.getNodeByIdAsync(ids[0]);
+  if (!node) throw new Error(`Node '${ids[0]}' not found`);
+  type DevNode = BaseNode & {
+    addDevResourceAsync?(url: string, name?: string): Promise<void>;
+    getDevResourcesAsync?(): Promise<Array<{ name: string; url: string }>>;
+    deleteDevResourceAsync?(url: string): Promise<void>;
+  };
+  const dev = node as DevNode;
+  if (action === "add") {
+    if (!dev.addDevResourceAsync) throw new Error("Dev resources not supported on this node/runtime.");
+    await dev.addDevResourceAsync(String(args.url ?? ""), args.name != null ? String(args.name) : undefined);
+    return { ok: true, nodeId: node.id };
+  }
+  if (action === "delete") {
+    if (!dev.deleteDevResourceAsync) throw new Error("Dev resources not supported on this node/runtime.");
+    await dev.deleteDevResourceAsync(String(args.url ?? ""));
+    return { ok: true, nodeId: node.id };
+  }
+  if (!dev.getDevResourcesAsync) throw new Error("Dev resources not supported on this node/runtime.");
+  const resources = await dev.getDevResourcesAsync();
+  return { nodeId: node.id, resources };
 }
 
 function coerceVariableValue(type: string, value: unknown): VariableValue {
