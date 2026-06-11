@@ -431,6 +431,14 @@ export async function applyTheme(
     : null;
   const restRootPromise = usePlugin ? null : loadNode(getClient(), target);
 
+  // Shadow handlers: if setActivePromise rejects while these are still
+  // in-flight, their own (later) rejection would otherwise be unhandled —
+  // which crashes Node under the default --unhandled-rejections=throw.
+  // The no-op catch marks the rejection handled; the real `await` below
+  // still observes (and rethrows) it.
+  enumPromise?.catch(() => {});
+  restRootPromise?.catch(() => {});
+
   const { resolve, resolveInline } = getMemoizedResolver(values, enabledSets, selectedTokenSets);
 
   const setActiveResult = await setActivePromise;

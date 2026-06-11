@@ -17,7 +17,7 @@
  * Everything not covered here is reachable via the `evalCode` op.
  */
 
-import { parseColor } from "./color.js";
+import { colorToPaints, parseColor } from "./color.js";
 import { sanitize } from "./eval.js";
 
 export async function opNodeOp(params: unknown): Promise<unknown> {
@@ -115,10 +115,10 @@ async function createOne(
       node = figma.createNodeFromSvg(svg);
       // Recolor every vector fill when a color is given (icon tinting).
       if (args.fill != null && args.fill !== "none") {
-        const paint = solidPaint(String(args.fill));
+        const paints = colorToPaints(String(args.fill));
         const tint = (n: SceneNode): void => {
           if ("fills" in n && Array.isArray((n as GeometryMixin).fills) && ((n as GeometryMixin).fills as readonly Paint[]).length > 0) {
-            (n as GeometryMixin).fills = [paint];
+            (n as GeometryMixin).fills = paints;
           }
           if ("children" in n) for (const c of (n as ChildrenMixin).children) tint(c as SceneNode);
         };
@@ -235,8 +235,9 @@ async function setNodeProps(args: Record<string, unknown>): Promise<unknown> {
   const ids = await resolveTargetIds(args);
   const props = (args.props ?? args) as Record<string, unknown>;
   const results: Array<{ id: string; ok: boolean; error?: string }> = [];
+  const nodeMap = await fetchNodesById(ids);
   for (const id of ids) {
-    const node = await figma.getNodeByIdAsync(id);
+    const node = nodeMap.get(id) ?? null;
     if (!node || node.type === "PAGE" || node.type === "DOCUMENT") {
       results.push({ id, ok: false, error: "node not found" });
       continue;
@@ -279,10 +280,12 @@ async function setNodeProps(args: Record<string, unknown>): Promise<unknown> {
 /** Properties shared by createNode and setNodeProps. */
 function applySharedProps(node: SceneNode, props: Record<string, unknown>): void {
   if (props.fill != null && "fills" in node) {
-    (node as GeometryMixin).fills = props.fill === "none" ? [] : [solidPaint(String(props.fill))];
+    // colorToPaints also parses gradient strings — gradients work everywhere
+    // a fill does.
+    (node as GeometryMixin).fills = props.fill === "none" ? [] : colorToPaints(String(props.fill));
   }
   if (props.stroke != null && "strokes" in node) {
-    (node as GeometryMixin).strokes = props.stroke === "none" ? [] : [solidPaint(String(props.stroke))];
+    (node as GeometryMixin).strokes = props.stroke === "none" ? [] : colorToPaints(String(props.stroke));
   }
   if (props.strokeWeight != null && "strokeWeight" in node) {
     (node as unknown as { strokeWeight: number }).strokeWeight = Number(props.strokeWeight);
@@ -349,16 +352,13 @@ function applyAutoLayoutProps(node: SceneNode, props: Record<string, unknown>): 
 function parsePadding(v: unknown): [number, number, number, number] {
   if (typeof v === "number") return [v, v, v, v];
   const parts = String(v).trim().split(/[\s/]+/).map(Number);
+  if (parts.some((n) => !Number.isFinite(n))) {
+    throw new Error(`Couldn't parse padding '${String(v)}' — expected numbers like 8, '8 16', or '8/16/8/16'.`);
+  }
   if (parts.length === 1) return [parts[0], parts[0], parts[0], parts[0]];
   if (parts.length === 2) return [parts[0], parts[1], parts[0], parts[1]];
   if (parts.length === 3) return [parts[0], parts[1], parts[2], parts[1]];
   return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0, parts[3] ?? 0];
-}
-
-function solidPaint(color: string): SolidPaint {
-  const rgb = parseColor(color);
-  const paint: SolidPaint = { type: "SOLID", color: { r: rgb.r, g: rgb.g, b: rgb.b } };
-  return rgb.a < 1 ? { ...paint, opacity: rgb.a } : paint;
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +368,10 @@ function solidPaint(color: string): SolidPaint {
 async function nodeAction(args: Record<string, unknown>): Promise<unknown> {
   const action = String(args.action ?? "");
   const ids = await resolveTargetIds(args);
+  const nodeMap = await fetchNodesById(ids);
   const nodes: SceneNode[] = [];
   for (const id of ids) {
-    const n = await figma.getNodeByIdAsync(id);
+    const n = nodeMap.get(id);
     if (n && n.type !== "PAGE" && n.type !== "DOCUMENT") nodes.push(n as SceneNode);
   }
   if (nodes.length === 0) throw new Error("No matching nodes (pass nodeIds or make a selection in Figma).");
@@ -456,6 +457,16 @@ async function resolveTargetIds(args: Record<string, unknown>): Promise<string[]
   if (Array.isArray(args.nodeIds) && args.nodeIds.length > 0) return args.nodeIds.map(String);
   if (typeof args.nodeId === "string" && args.nodeId) return [args.nodeId];
   return figma.currentPage.selection.map((n) => n.id);
+}
+
+/** Parallel node lookup — same pattern as writes/batch.ts prefetch. */
+async function fetchNodesById(ids: string[]): Promise<Map<string, BaseNode | null>> {
+  const map = new Map<string, BaseNode | null>();
+  await Promise.all(ids.map(async (id) => {
+    try { map.set(id, await figma.getNodeByIdAsync(id)); }
+    catch { map.set(id, null); }
+  }));
+  return map;
 }
 
 // ---------------------------------------------------------------------------
@@ -617,8 +628,9 @@ async function variablesOp(args: Record<string, unknown>): Promise<unknown> {
       if (!variable) throw new Error(`Variable '${ref}' not found (by id or name)`);
       const field = String(args.field ?? "fill");
       let bound = 0;
+      const nodeMap = await fetchNodesById(ids);
       for (const id of ids) {
-        const node = await figma.getNodeByIdAsync(id);
+        const node = nodeMap.get(id);
         if (!node) continue;
         if (field === "fill" || field === "stroke") {
           const key = field === "fill" ? "fills" : "strokes";
@@ -648,8 +660,8 @@ async function variablesOp(args: Record<string, unknown>): Promise<unknown> {
       const filtered = wanted ? all.filter((v) => v.variableCollectionId === wanted.id) : all;
       const hexOf = (val: unknown): string | null => {
         const c = val as { r?: number; g?: number; b?: number };
-        if (typeof c?.r !== "number") return null;
-        return rgbToHex({ r: c.r, g: c.g!, b: c.b! });
+        if (typeof c?.r !== "number" || typeof c?.g !== "number" || typeof c?.b !== "number") return null;
+        return rgbToHex({ r: c.r, g: c.g, b: c.b });
       };
       if (sub === "exportCss") {
         const lines = filtered.map((v) => {

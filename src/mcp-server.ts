@@ -260,7 +260,7 @@ server.tool(
       }
       const client = getClient();
       const node = await loadNode(client, target, 1);
-      return { content: [{ type: "text" as const, text: renderSingleNodeTokens(node) }] };
+      return textResult(renderSingleNodeTokens(node));
     } catch (err) {
       return toolError(err);
     }
@@ -345,7 +345,7 @@ server.tool(
         includeComposition:
           args.includeComposition ?? config.includeComposition,
       });
-      return { content: [{ type: "text" as const, text }] };
+      return textResult(text);
     } catch (err) {
       return toolError(err);
     }
@@ -1626,8 +1626,12 @@ server.tool(
     try {
       const res = await fetch(args.url, { signal: AbortSignal.timeout(30_000) });
       if (!res.ok) throw new Error(`Image fetch failed: ${res.status} ${res.statusText} for ${args.url}`);
-      const buf = Buffer.from(await res.arrayBuffer());
       const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+      const declared = Number(res.headers.get("content-length") ?? 0);
+      if (declared > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is ${(declared / 1024 / 1024).toFixed(1)} MB — over the 8 MB limit for the plugin bridge.`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length > MAX_IMAGE_BYTES) {
         throw new Error(`Image is ${(buf.length / 1024 / 1024).toFixed(1)} MB — over the 8 MB limit for the plugin bridge.`);
       }
