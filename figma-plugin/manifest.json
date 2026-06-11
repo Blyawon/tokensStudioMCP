@@ -1,0 +1,19 @@
+{
+  "name": "Tokens Studio MCP Bridge",
+  "id": "tokens-studio-mcp-bridge",
+  "api": "1.0.0",
+  "main": "dist/code.js",
+  "ui": "dist/ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "enablePrivatePluginApi": true,
+  "networkAccess": {
+    "allowedDomains": [
+      "http://localhost:3055",
+      "https://localhost:3055",
+      "ws://localhost:3055",
+      "wss://localhost:3055"
+    ],
+    "reasoning": "Connects to the local Tokens Studio MCP bridge to apply token remappings driven from chat."
+  }
+}

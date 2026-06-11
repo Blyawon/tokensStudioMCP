@@ -53,8 +53,13 @@ function parseFigmaUrl(url: string): { fileKey: string; nodeId?: string } {
   let parsed: URL;
   try {
     parsed = new URL(url);
-  } catch {
-    throw new Error(`Could not parse URL: ${url}`);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `Couldn't parse that URL: ${reason}.\n` +
+        `If your URL has \`&node-id=…\` the shell may have cut it off — wrap the URL in single quotes.\n` +
+        `Got: ${url}`
+    );
   }
 
   // Path shapes: /design/<key>/..., /file/<key>/..., /board/<key>/...
@@ -64,7 +69,9 @@ function parseFigmaUrl(url: string): { fileKey: string; nodeId?: string } {
   );
   if (keyIndex === -1 || !segments[keyIndex + 1]) {
     throw new Error(
-      `URL does not look like a Figma file URL: ${url}`
+      `That URL doesn't look like a Figma file URL.\n` +
+        `Expected a path like /design/<fileKey>/... or /board/<fileKey>/....\n` +
+        `Got: ${url}`
     );
   }
 
@@ -77,7 +84,6 @@ function parseFigmaUrl(url: string): { fileKey: string; nodeId?: string } {
 /** Figma REST API expects `1:2`. URLs use `1-2`. Normalize to `:`. */
 export function normalizeNodeId(id: string): string {
   const trimmed = id.trim();
-  // Preserve existing `:` separator; otherwise swap the first `-` for `:`.
   if (trimmed.includes(":")) return trimmed;
-  return trimmed.replace("-", ":");
+  return trimmed.replaceAll("-", ":");
 }

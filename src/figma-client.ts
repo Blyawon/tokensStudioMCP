@@ -74,19 +74,44 @@ export class FigmaClient {
   }
 
   private async request<T>(url: URL): Promise<T> {
-    const res = await fetch(url, {
-      headers: {
-        "X-Figma-Token": this.apiKey,
-      },
-    });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    try {
+      const res = await fetch(url, {
+        headers: { "X-Figma-Token": this.apiKey },
+        signal: controller.signal,
+      });
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      throw new Error(
-        `Figma API ${res.status} ${res.statusText} for ${url.pathname}${url.search}: ${body}`
-      );
+      if (!res.ok) {
+        const body = await res.text().catch(() => "(no response body)");
+        throw new Error(formatFigmaApiError(res.status, res.statusText, url, body));
+      }
+
+      return (await res.json()) as T;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        throw new Error(
+          `Figma API request timed out after 30 s for ${url.pathname}${url.search}. ` +
+            "Check your network connection and try again."
+        );
+      }
+      throw err;
+    } finally {
+      clearTimeout(timeout);
     }
-
-    return (await res.json()) as T;
   }
+}
+
+function formatFigmaApiError(status: number, statusText: string, url: URL, body: string): string {
+  const trimmed = body.length > 400 ? body.slice(0, 400) + "…" : body;
+  const hintByStatus: Record<number, string> = {
+    401: "Your FIGMA_API_KEY was rejected. Run `ft setup` to store a working personal access token.",
+    403: "FIGMA_API_KEY doesn't have access to this file. Check the token's scope, or ask the file owner to add you.",
+    404: "File or node not found. Double-check the URL — fileKey or node-id may be wrong, or the file may have been deleted.",
+    429: "Figma is rate-limiting this token. Wait a minute and try again, or slow down parallel requests.",
+  };
+  let hint = hintByStatus[status];
+  if (!hint && status >= 500) hint = "Figma's API is having trouble. Retry in a bit; if it keeps failing, check status.figma.com.";
+  const main = `Figma API returned ${status}${statusText ? " " + statusText : ""} for ${url.pathname}${url.search}.`;
+  return hint ? `${main}\n${hint}\n(raw: ${trimmed})` : `${main}\n(raw: ${trimmed})`;
 }

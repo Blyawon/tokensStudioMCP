@@ -412,12 +412,48 @@ npx tsx --test src/tokens.test.ts src/render-tree.test.ts
 
 ## Scope
 
-- **Read only.** `ft` never writes tokens back to Figma.
+- **Reads** via the Figma REST API. **Writes** are opt-in and go
+  through the companion plugin (see *Token remapping* below) — the CLI
+  itself only reads.
 - Returns token **names** (reference paths like
   `colors.primary.500`) — not resolved values. Composition token
   values are shown as full reference paths when
   `--with-composition` is on.
 - Node 18+ (native `fetch`).
+
+---
+
+## Token remapping (MCP)
+
+When connected via MCP, three additional tools enable AI-driven token
+remapping — useful for porting an old component onto a new token set:
+
+- **`propose_token_remap`** — read-only. Takes a Figma URL plus the new
+  token JSON you pasted in chat (Tokens Studio export, DTCG, or a flat
+  list of paths — all accepted) and returns a candidate plan with
+  scores and ambiguous cases for the agent to resolve.
+- **`apply_token_remap`** — applies a plan to the live Figma file via
+  the companion plugin. Whole batch is wrapped in a single Figma undo
+  entry (Cmd-Z reverts it all). Supports `dryRun: true`.
+- **`bridge_status`** — diagnostic; reports whether the WebSocket
+  bridge is up and whether the plugin is connected.
+
+### Plugin install
+
+The Figma REST API can read shared plugin data but cannot write it —
+that mutation is plugin-only. So `apply_token_remap` ships its writes
+through a tiny companion plugin you install once:
+
+1. `npm run build:plugin`
+2. In Figma → **Plugins → Development → Import plugin from manifest…**
+3. Pick `figma-plugin/manifest.json` from this repo.
+4. Run the plugin (Plugins → Development → Tokens Studio MCP Bridge)
+   in the file you want to remap. The plugin UI should turn green
+   ("Connected") once the MCP server's bridge is running.
+
+The plugin opens a WebSocket to `ws://localhost:3055`, which the MCP
+server starts on demand the first time you call `bridge_status` or
+`apply_token_remap`. Only one Figma window can be connected at a time.
 
 See [CHANGELOG.md](./CHANGELOG.md) for the v0.1 → v0.2 history.
 

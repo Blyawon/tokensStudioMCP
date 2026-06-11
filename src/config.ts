@@ -77,7 +77,7 @@ export function loadConfig(cwd: string = process.cwd()): LoadedConfig {
   const userPath = resolve(homedir(), USER_CONFIG);
   const userParsed = tryReadJson(userPath);
   if (userParsed) {
-    merged = mergeConfig(merged, userParsed);
+    merged = mergeConfig(merged, userParsed, userPath);
     sources.push(userPath);
   }
 
@@ -86,7 +86,7 @@ export function loadConfig(cwd: string = process.cwd()): LoadedConfig {
     const p = resolve(cwd, fn);
     const parsed = tryReadJson(p);
     if (parsed) {
-      merged = mergeConfig(merged, parsed);
+      merged = mergeConfig(merged, parsed, p);
       sources.push(p);
       break;
     }
@@ -125,12 +125,28 @@ function tryReadJson(path: string): Partial<FtConfig> | null {
   }
 }
 
-function mergeConfig(base: FtConfig, override: Partial<FtConfig>): FtConfig {
+const KNOWN_KEYS = new Set<string>([
+  "ignoreVectorsWithoutFill",
+  "ignoreComponents",
+  "warnStyleGaps",
+  "onlyWithTokens",
+  "includeComposition",
+]);
+
+function mergeConfig(base: FtConfig, override: Partial<FtConfig>, source?: string): FtConfig {
   const out: FtConfig = { ...base };
-  for (const key of Object.keys(override) as (keyof FtConfig)[]) {
-    const value = override[key];
+  for (const key of Object.keys(override)) {
+    if (!KNOWN_KEYS.has(key)) {
+      const label = source ? ` (${source})` : "";
+      process.stderr.write(
+        `ft: unknown config key "${key}"${label} — ` +
+          `known keys: ${Array.from(KNOWN_KEYS).join(", ")}\n`
+      );
+      continue;
+    }
+    const value = override[key as keyof FtConfig];
     if (typeof value === "boolean") {
-      (out[key] as boolean) = value;
+      (out[key as keyof FtConfig] as boolean) = value;
     }
   }
   return out;
