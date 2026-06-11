@@ -155,6 +155,13 @@ export const SetActiveThemeParams = z.object({
   themeId: z.string().optional(),
   themeGroup: z.string().optional(),
   enabledSets: z.array(z.string()),
+  /**
+   * Full set-status map (enabled/disabled/source) — preserved so the
+   * plugin can write an accurate `usedTokenSet` blob instead of marking
+   * every enabled set as plain "enabled". The server has always sent
+   * this; the schema previously omitted it (strict-mode drift).
+   */
+  selectedTokenSets: z.record(z.string()).optional(),
 }).strict();
 export const SetActiveThemeResult = z.object({
   ok: z.literal(true),
@@ -291,6 +298,34 @@ export const InspectBoundVariablesResult = z.object({
     textStyleId: z.string().nullable(),
   })),
 });
+
+// --------------------------------------------------------------------------
+// Canvas authoring ops — figma-cli parity through the long-lived plugin.
+// --------------------------------------------------------------------------
+
+/**
+ * Execute arbitrary JavaScript inside the plugin sandbox (full `figma`
+ * plugin API). Localhost bridge only; same trust level as the plugin
+ * itself. Results are sanitized JSON (nodes → {id,name,type} stubs).
+ */
+export const EvalCodeParams = z.object({
+  code: z.string(),
+  timeoutMs: z.number().int().positive().optional(),
+}).strict();
+export const EvalCodeResult = z.object({ result: z.unknown() });
+
+/**
+ * Structured node operation dispatcher. `op` selects the operation
+ * (createNode / setNodeProps / nodeAction / getNodeTree / findNodes /
+ * exportNode / variables); `args` is op-specific and validated by the
+ * sandbox implementation. Kept loose here on purpose — one wire method
+ * instead of seven keeps the protocol (and version-skew surface) small.
+ */
+export const NodeOpParams = z.object({
+  op: z.string(),
+  args: z.record(z.unknown()).optional(),
+}).strict();
+export const NodeOpResult = z.unknown();
 
 // --------------------------------------------------------------------------
 // SERVER-handled methods — called by the plugin UI's "Test & pull" controls.
@@ -533,6 +568,8 @@ export const PLUGIN_METHODS = [
   "enumerateTokenizedNodes",
   "getLiveTarget",
   "inspectBoundVariables",
+  "evalCode",
+  "nodeOp",
 ] as const;
 
 /**
@@ -642,6 +679,8 @@ export const SCHEMAS: Record<
   inspectNode: { params: InspectNodeParams, result: InspectNodeResult },
   stageTokenFix: { params: StageTokenFixParams, result: StageTokenFixResult },
   inspectBoundVariables: { params: InspectBoundVariablesParams, result: InspectBoundVariablesResult },
+  evalCode: { params: EvalCodeParams, result: EvalCodeResult },
+  nodeOp: { params: NodeOpParams, result: NodeOpResult },
 };
 
 export const DEFAULT_BRIDGE_PORT = 3055;

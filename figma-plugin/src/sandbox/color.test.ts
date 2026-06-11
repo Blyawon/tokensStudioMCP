@@ -90,11 +90,11 @@ test("parseColor: hsl(120, 100%, 50%) = green", () => {
 
 test("parseColor: bad hex length throws", () => {
   // 5 chars is neither #rgb, #rrggbb, nor #rrggbbaa.
-  assert.throws(() => parseColor("#12345"), /Bad hex/);
+  assert.throws(() => parseColor("#12345"), /Expected a hex colour/);
 });
 
 test("parseColor: unsupported format throws with descriptive message", () => {
-  assert.throws(() => parseColor("banana"), /Unsupported color format/);
+  assert.throws(() => parseColor("banana"), /Unsupported colour format/);
 });
 
 test("parseColor: named color 'transparent' → fully transparent", () => {
@@ -149,7 +149,7 @@ test("numericValue: raw number passthrough", () => {
 });
 
 test("numericValue: throws on non-numeric", () => {
-  assert.throws(() => numericValue("abc"), /Not a number/);
+  assert.throws(() => numericValue("abc"), /Expected a numeric value/);
 });
 
 test("numericOrUndefined: returns undefined for nullish", () => {
