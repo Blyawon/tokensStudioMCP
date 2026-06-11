@@ -28,6 +28,7 @@ import {
 import { makeSkipPredicate, extractTokens } from "./tokens.js";
 import { renderMetadataXml, renderSingleNodeTokens } from "./xml.js";
 import { renderCompactTree, renderTokensList } from "./render-tree.js";
+import { renderDesignContext } from "./design-context.js";
 import {
   fetchCatalog,
   invalidateCatalogCache,
@@ -84,6 +85,56 @@ const server = new McpServer({
 });
 
 // --------------------------------------------------------------------------
+// Shared helpers
+// --------------------------------------------------------------------------
+
+function textResult(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+
+/** Compact JSON — agents parse it fine and it's ~30% fewer tokens than pretty-printed. */
+function jsonResult(value: unknown) {
+  return textResult(JSON.stringify(value));
+}
+
+async function requireBridge() {
+  const bridge = getBridge();
+  await bridge.start();
+  if (!bridge.isConnected()) {
+    throw new Error(
+      "Figma plugin not connected. Open the 'Tokens Studio MCP Bridge' plugin in Figma (Plugins → Development) — it can stay open in any tab."
+    );
+  }
+  return bridge;
+}
+
+async function bridgeNodeOp(op: string, args: Record<string, unknown>, timeoutMs = 120_000): Promise<unknown> {
+  const bridge = await requireBridge();
+  return bridge.request("nodeOp", { op, args }, { timeoutMs });
+}
+
+/**
+ * Slim working-copy summary for edit-tool responses. The previous behavior
+ * (full snapshot incl. the entire edit log on EVERY set/delete/rename) made
+ * a 50-edit session quadratic in context tokens. `list_pending_edits` still
+ * returns the full snapshot when the agent actually wants it.
+ */
+function workingCopySummary() {
+  const snap = snapshotWorkingCopy() as
+    | { branch?: string; baseSha?: string; editCount?: number; edits?: unknown[] }
+    | null;
+  if (!snap) return null;
+  const edits = Array.isArray(snap.edits) ? snap.edits : [];
+  return {
+    ok: true,
+    branch: snap.branch,
+    baseSha: snap.baseSha,
+    editCount: snap.editCount ?? edits.length,
+    lastEdit: edits.length > 0 ? edits[edits.length - 1] : null,
+  };
+}
+
+// --------------------------------------------------------------------------
 // Reading tools
 // --------------------------------------------------------------------------
 
@@ -99,7 +150,8 @@ server.tool(
     'no covering token get an untokenized="fill,stroke,…" attribute on their ' +
     "tokens element. x/y/w/h are omitted by default — pass layout=true if you " +
     "need them. Composition tokens are stripped by default (they duplicate " +
-    "individual property tokens); pass includeComposition=true to include them.",
+    "individual property tokens); pass includeComposition=true to include them. " +
+    "Pass format='tree' for a compact markdown tree (~50% fewer tokens than XML).",
   {
     url: z.string().optional(),
     fileKey: z.string().optional(),
@@ -111,6 +163,7 @@ server.tool(
     includeComposition: z.boolean().optional(),
     withComponents: z.boolean().optional(),
     withVectors: z.boolean().optional(),
+    format: z.enum(["xml", "tree"]).optional(),
   },
   async (args) => {
     try {
@@ -124,7 +177,7 @@ server.tool(
         ignoreVectorsWithoutFill: args.withVectors ? false : baseConfig.ignoreVectorsWithoutFill,
       };
       const skipNode = makeSkipPredicate(config);
-      const result = renderMetadataXml(node, {
+      const renderOpts = {
         onlyWithTokens: args.onlyWithTokens ?? config.onlyWithTokens,
         onlyGaps: args.onlyGaps,
         layout: args.layout,
@@ -132,8 +185,56 @@ server.tool(
         includeComposition:
           args.includeComposition ?? config.includeComposition,
         skipNode,
-      });
-      return { content: [{ type: "text" as const, text: result.xml }] };
+      };
+      if (args.format === "tree") {
+        return textResult(renderCompactTree(node, renderOpts).text);
+      }
+      return textResult(renderMetadataXml(node, renderOpts).xml);
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "get_design_context",
+  "THE tool for building code from a Figma design — replaces the need for a " +
+    "separate Figma MCP. Returns a compact markdown tree of a node/subtree " +
+    "carrying everything needed to rebuild it: auto-layout (direction, gap, " +
+    "padding, alignment, hug/fill sizing), constraints, fills/strokes/" +
+    "gradients with resolved hex colors, stroke weight, corner radius, " +
+    "effects (shadows/blur), opacity, blend mode, typography (family, " +
+    "weight, size, line-height, tracking), text content, component/instance " +
+    "relationships + variant props — AND the Tokens Studio tokens applied " +
+    "to each node, so generated code can use design-token variables instead " +
+    "of hard-coded values. One line per node; defaults omitted.",
+  {
+    url: z.string().optional(),
+    fileKey: z.string().optional(),
+    nodeId: z.string().optional(),
+    depth: z.number().int().positive().optional()
+      .describe("Figma REST fetch depth (subtree levels)."),
+    maxDepth: z.number().int().positive().optional()
+      .describe("Max rendered tree depth. Default 12."),
+    withTokens: z.boolean().optional(),
+    withPosition: z.boolean().optional()
+      .describe("Include x,y per node (relative to root). Default true."),
+  },
+  async (args) => {
+    try {
+      const target = parseFigmaTargetOrPinned(args);
+      const client = getClient();
+      const node = await loadNode(client, target, args.depth);
+      const config = getLoadedConfig().config;
+      const skipNode = makeSkipPredicate(config);
+      return textResult(
+        renderDesignContext(node, {
+          maxDepth: args.maxDepth,
+          withTokens: args.withTokens,
+          withPosition: args.withPosition,
+          skipNode,
+        })
+      );
     } catch (err) {
       return toolError(err);
     }
@@ -159,7 +260,7 @@ server.tool(
       }
       const client = getClient();
       const node = await loadNode(client, target, 1);
-      return { content: [{ type: "text" as const, text: renderSingleNodeTokens(node) }] };
+      return textResult(renderSingleNodeTokens(node));
     } catch (err) {
       return toolError(err);
     }
@@ -244,7 +345,7 @@ server.tool(
         includeComposition:
           args.includeComposition ?? config.includeComposition,
       });
-      return { content: [{ type: "text" as const, text }] };
+      return textResult(text);
     } catch (err) {
       return toolError(err);
     }
@@ -411,19 +512,43 @@ server.tool(
       .passthrough()
       .optional(),
     secret: z.string().optional(),
+    setFilter: z.array(z.string()).optional()
+      .describe("Only include these token sets (exact names). Big catalogs are 100s of KB — filter when you can."),
+    pathPrefix: z.string().optional()
+      .describe("Only include tokens whose path starts with this prefix, e.g. 'colors.brand'."),
   },
   async (args) => {
     try {
       const config = await resolveStorageConfig(args.override);
       const catalog = await fetchCatalog(config, { secret: args.secret });
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(catalog, null, 2) }],
-      };
+      let out: Record<string, unknown> = catalog as unknown as Record<string, unknown>;
+      if (args.setFilter || args.pathPrefix) {
+        const values = (catalog.values ?? {}) as Record<string, unknown>;
+        const filteredValues: Record<string, unknown> = {};
+        for (const [setName, tree] of Object.entries(values)) {
+          if (args.setFilter && !args.setFilter.includes(setName)) continue;
+          filteredValues[setName] = args.pathPrefix
+            ? filterTreeByPrefix(tree, args.pathPrefix.split("."))
+            : tree;
+        }
+        out = { ...out, values: filteredValues, filtered: true };
+      }
+      // Compact JSON on purpose — pretty-printing a full catalog wastes ~30%.
+      return jsonResult(out);
     } catch (err) {
       return toolError(err);
     }
   }
 );
+
+/** Keep only the branch of a token tree under a dotted path prefix. */
+function filterTreeByPrefix(tree: unknown, segments: string[]): unknown {
+  if (segments.length === 0 || tree == null || typeof tree !== "object") return tree;
+  const [head, ...rest] = segments;
+  const obj = tree as Record<string, unknown>;
+  if (!(head in obj)) return {};
+  return { [head]: filterTreeByPrefix(obj[head], rest) };
+}
 
 server.tool(
   "list_themes",
@@ -754,9 +879,7 @@ server.tool(
       const config = await resolveStorageConfig(undefined);
       await ensureWorkingCatalog(config);
       addEdit({ kind: "set", path: args.path, value: args.value, type: args.type, set: args.set });
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(snapshotWorkingCopy(), null, 2) }],
-      };
+      return jsonResult(workingCopySummary());
     } catch (err) {
       return toolError(err);
     }
@@ -776,9 +899,7 @@ server.tool(
       const config = await resolveStorageConfig(undefined);
       await ensureWorkingCatalog(config);
       addEdit({ kind: "delete", path: args.path, set: args.set });
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(snapshotWorkingCopy(), null, 2) }],
-      };
+      return jsonResult(workingCopySummary());
     } catch (err) {
       return toolError(err);
     }
@@ -808,9 +929,7 @@ server.tool(
         set: args.set,
         updateRefs: args.updateReferences ?? true,
       });
-      return {
-        content: [{ type: "text" as const, text: JSON.stringify(snapshotWorkingCopy(), null, 2) }],
-      };
+      return jsonResult(workingCopySummary());
     } catch (err) {
       return toolError(err);
     }
@@ -1190,6 +1309,406 @@ server.tool(
           }, null, 2),
         }],
       };
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+// --------------------------------------------------------------------------
+// Canvas authoring tools — figma-cli parity via the long-lived plugin.
+// These work on the file the plugin is OPEN IN (any tab, drafts included);
+// no REST API key or fileKey needed.
+// --------------------------------------------------------------------------
+
+server.tool(
+  "figma_eval",
+  "Execute JavaScript inside the connected Figma plugin sandbox with the " +
+    "full `figma` Plugin API in scope (create/edit any node, variables, " +
+    "styles, components, viewport, exports — everything). Code runs in an " +
+    "async IIFE: `await` works, the last expression (or `return …`) is the " +
+    "result. Figma nodes in the result come back as {id,name,type} stubs. " +
+    "Use the structured tools (create_node, set_node_properties, …) for " +
+    "common operations; reach for eval when you need something they don't " +
+    "cover. Each call is one Figma undo step.",
+  {
+    code: z.string().describe("JavaScript to run, e.g. `figma.currentPage.selection.map(n => n.name)`"),
+    timeoutMs: z.number().int().positive().optional(),
+  },
+  async (args) => {
+    try {
+      const bridge = await requireBridge();
+      const result = await bridge.request("evalCode", {
+        code: args.code,
+        timeoutMs: args.timeoutMs,
+      }, { timeoutMs: (args.timeoutMs ?? 30_000) + 5_000 });
+      return jsonResult(result);
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "create_node",
+  "Create a node in the live Figma file via the plugin: frame, rectangle, " +
+    "ellipse, line, text, autolayout (frame with flex), or instance (from a " +
+    "componentId). Auto-positions right of existing content unless x is " +
+    "given. Supports fill/stroke (hex, rgb(), hsl(), or 'none'), " +
+    "cornerRadius, opacity, and auto-layout props (layout='row'|'col', gap, " +
+    "padding, justify/items = start|center|end|between, sizingHorizontal/" +
+    "Vertical = HUG|FILL|FIXED). Text supports characters, fontSize, " +
+    "fontFamily, fontStyle. Pass `children` (array of nested create_node " +
+    "specs, same shape minus parentId) to build a WHOLE TREE in one call — " +
+    "e.g. a card frame with title + body + button. Also supports type='svg' " +
+    "({svg: markup}), 'image' ({base64}), 'section', and in FigJam files " +
+    "'sticky', 'connector' ({startNodeId,endNodeId}), 'shape'. Returns the " +
+    "new root node's id.",
+  {
+    type: z.enum(["frame", "rectangle", "ellipse", "line", "text", "autolayout", "instance", "svg", "image", "section", "sticky", "connector", "shape"]),
+    name: z.string().optional(),
+    parentId: z.string().optional().describe("Append into this node instead of the page."),
+    componentId: z.string().optional().describe("For type='instance'."),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    width: z.number().optional(),
+    height: z.number().optional(),
+    fill: z.string().optional(),
+    stroke: z.string().optional(),
+    strokeWeight: z.number().optional(),
+    cornerRadius: z.number().optional(),
+    opacity: z.number().optional(),
+    layout: z.enum(["row", "col", "none"]).optional(),
+    gap: z.number().optional(),
+    padding: z.union([z.number(), z.string()]).optional().describe("Number or CSS-style '8 16' / '8/16/8/16'."),
+    justify: z.string().optional(),
+    items: z.string().optional(),
+    characters: z.string().optional(),
+    fontSize: z.number().optional(),
+    fontFamily: z.string().optional(),
+    fontStyle: z.string().optional(),
+    svg: z.string().optional().describe("SVG markup for type='svg'."),
+    base64: z.string().optional().describe("Base64 image bytes for type='image'."),
+    startNodeId: z.string().optional(),
+    endNodeId: z.string().optional(),
+    shapeType: z.string().optional(),
+    children: z.array(z.record(z.unknown())).optional()
+      .describe("Nested create_node specs (recursive). Child-only extras: sizingHorizontal/sizingVertical = HUG|FILL|FIXED."),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("createNode", args));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "set_node_properties",
+  "Edit properties on existing nodes (by nodeIds, single nodeId, or the " +
+    "current Figma selection when neither is given). Same property surface " +
+    "as create_node — fill, stroke, strokeWeight, cornerRadius, opacity, " +
+    "x/y/width/height, name, visible, locked, rotation, auto-layout props " +
+    "(layout/gap/padding/justify/items/sizing), constraints " +
+    "({horizontal,vertical} = MIN|CENTER|MAX|STRETCH|SCALE), and text " +
+    "(characters, fontSize, fontFamily/fontStyle — fonts auto-loaded). " +
+    "Applies to every target node; returns per-node ok/error.",
+  {
+    nodeIds: z.array(z.string()).optional(),
+    nodeId: z.string().optional(),
+    props: z.record(z.unknown()).describe("Properties to set, e.g. { fill: '#FF0000', gap: 8, layout: 'row' }"),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("setNodeProps", {
+        nodeIds: args.nodeIds, nodeId: args.nodeId, props: args.props,
+      }));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "node_action",
+  "Run a structural action on nodes (by nodeIds / nodeId / current " +
+    "selection): delete, clone (with offset), select (+scroll into view), " +
+    "zoom, group, to-component (convert each node to a component), " +
+    "combine-variants (promote frames to components and combine into a " +
+    "component set — name them 'Prop=Value' first), append (move into " +
+    "parentId), or arrange (grid-layout the targets with gap/columns).",
+  {
+    action: z.enum(["delete", "clone", "select", "zoom", "group", "to-component", "combine-variants", "append", "arrange"]),
+    nodeIds: z.array(z.string()).optional(),
+    nodeId: z.string().optional(),
+    name: z.string().optional().describe("Name for group / component set."),
+    parentId: z.string().optional().describe("Target parent for 'append'."),
+    offset: z.number().optional().describe("Clone offset in px (default 20)."),
+    gap: z.number().optional().describe("Grid gap for 'arrange' (default 40)."),
+    columns: z.number().int().positive().optional().describe("Grid columns for 'arrange'."),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("nodeAction", args));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "get_canvas_tree",
+  "Live node tree from the plugin — works in ANY file the plugin is open " +
+    "in (drafts, branches, files without REST access), no fileKey needed. " +
+    "Root = nodeId, else the single selected node, else the current page. " +
+    "Each node carries id/name/type, x/y/w/h, auto-layout props, fills, " +
+    "radius, and text font/size/content. Depth-limited (default 6, max 12).",
+  {
+    nodeId: z.string().optional(),
+    depth: z.number().int().positive().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("getNodeTree", args));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "find_nodes",
+  "Find nodes on the current page by name substring and/or type " +
+    "(FRAME, TEXT, COMPONENT, INSTANCE, …) via the plugin. Returns " +
+    "id/name/type/bounds for up to `max` matches (default 50).",
+  {
+    name: z.string().optional(),
+    type: z.string().optional(),
+    max: z.number().int().positive().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("findNodes", args));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "export_node_image",
+  "Export a node (by nodeId or current selection) as PNG/JPG/SVG via the " +
+    "plugin. PNG/JPG come back as an inline image for visual verification " +
+    "of what you just built; SVG comes back as text.",
+  {
+    nodeId: z.string().optional(),
+    format: z.enum(["PNG", "JPG", "SVG"]).optional(),
+    scale: z.number().positive().max(4).optional(),
+  },
+  async (args) => {
+    try {
+      const r = (await bridgeNodeOp("exportNode", args, 120_000)) as {
+        nodeId: string; name: string; format: string; bytes: number; base64: string;
+      };
+      if (r.format === "SVG") {
+        const svg = Buffer.from(r.base64, "base64").toString("utf8");
+        return textResult(svg);
+      }
+      return {
+        content: [
+          {
+            type: "image" as const,
+            data: r.base64,
+            mimeType: r.format === "JPG" ? "image/jpeg" : "image/png",
+          },
+        ],
+      };
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "figma_variables",
+  "Figma Variables CRUD + binding via the plugin. sub-ops: " +
+    "'listCollections', 'list' (optionally filter by name), " +
+    "'createCollection' {name}, 'create' {name, collection, type: " +
+    "COLOR|FLOAT|STRING|BOOLEAN, value}, 'setValue' {variableId, value, " +
+    "modeId?}, 'bind' {variable (id or name), field: fill|stroke|" +
+    "cornerRadius|itemSpacing|paddingTop|…, nodeIds?/selection}, " +
+    "'exportCss' / 'exportTailwind' {collection?} (CSS custom properties / " +
+    "Tailwind theme.colors from the file's variables). Colors accept " +
+    "hex/rgb()/hsl().",
+  {
+    sub: z.enum(["listCollections", "list", "createCollection", "create", "setValue", "bind", "exportCss", "exportTailwind"]),
+    name: z.string().optional(),
+    collection: z.string().optional(),
+    type: z.string().optional(),
+    value: z.union([z.string(), z.number(), z.boolean()]).optional(),
+    variableId: z.string().optional(),
+    modeId: z.string().optional(),
+    variable: z.string().optional(),
+    field: z.string().optional(),
+    nodeIds: z.array(z.string()).optional(),
+    nodeId: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("variables", args));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "create_icon",
+  "Create an icon on the canvas from the Iconify catalog (200k+ icons: " +
+    "lucide:*, mdi:*, tabler:*, heroicons:*, …). The server fetches the SVG " +
+    "from api.iconify.design and the plugin renders it as vectors, " +
+    "optionally tinted with `color` and placed inside `parentId`.",
+  {
+    icon: z.string().describe("Iconify id, e.g. 'lucide:home' or 'mdi:account'."),
+    size: z.number().positive().optional().describe("Width/height in px (default 24)."),
+    color: z.string().optional().describe("Tint color (hex/rgb()/hsl())."),
+    name: z.string().optional(),
+    parentId: z.string().optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+  },
+  async (args) => {
+    try {
+      const [prefix, ...rest] = args.icon.split(":");
+      const iconName = rest.join(":");
+      if (!prefix || !iconName) {
+        throw new Error("icon must be '<set>:<name>', e.g. 'lucide:home'.");
+      }
+      const size = args.size ?? 24;
+      const url = `https://api.iconify.design/${encodeURIComponent(prefix)}/${encodeURIComponent(iconName)}.svg?height=${size}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) throw new Error(`Iconify returned ${res.status} for '${args.icon}' — check the icon id.`);
+      const svg = await res.text();
+      if (!svg.includes("<svg")) throw new Error(`Iconify response for '${args.icon}' wasn't SVG (icon may not exist).`);
+      return jsonResult(await bridgeNodeOp("createNode", {
+        type: "svg",
+        svg,
+        fill: args.color,
+        name: args.name ?? args.icon,
+        parentId: args.parentId,
+        x: args.x,
+        y: args.y,
+        width: size,
+        height: size,
+      }));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "create_image_from_url",
+  "Fetch an image from a URL (server-side) and place it on the canvas as a " +
+    "rectangle with an image fill — e.g. reference screenshots, logos, " +
+    "photos. Native image size is used unless width/height given.",
+  {
+    url: z.string().describe("Direct image URL (png/jpg/gif/webp)."),
+    name: z.string().optional(),
+    width: z.number().positive().optional(),
+    height: z.number().positive().optional(),
+    parentId: z.string().optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+  },
+  async (args) => {
+    try {
+      const res = await fetch(args.url, { signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`Image fetch failed: ${res.status} ${res.statusText} for ${args.url}`);
+      const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+      const declared = Number(res.headers.get("content-length") ?? 0);
+      if (declared > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is ${(declared / 1024 / 1024).toFixed(1)} MB — over the 8 MB limit for the plugin bridge.`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      if (buf.length > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is ${(buf.length / 1024 / 1024).toFixed(1)} MB — over the 8 MB limit for the plugin bridge.`);
+      }
+      return jsonResult(await bridgeNodeOp("createNode", {
+        type: "image",
+        base64: buf.toString("base64"),
+        name: args.name ?? args.url.split("/").pop()?.split("?")[0] ?? "Image",
+        parentId: args.parentId,
+        x: args.x,
+        y: args.y,
+        width: args.width,
+        height: args.height,
+      }, 180_000));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "canvas_audit",
+  "Accessibility audit of the live canvas via the plugin (scope: nodeId → " +
+    "selection → current page). Checks: 'contrast' (WCAG AA/AAA text-vs-" +
+    "background ratios, large-text aware), 'touch' (interactive elements " +
+    "≥44×44, detected by reactions or button/input-ish names), 'text' " +
+    "(minimum font size), or 'all'. Returns per-check counts + failing " +
+    "nodes with ids so fixes can target them directly.",
+  {
+    check: z.enum(["contrast", "touch", "text", "all"]).optional(),
+    nodeId: z.string().optional(),
+    level: z.enum(["AA", "AAA"]).optional(),
+    minTouch: z.number().positive().optional(),
+    minFontSize: z.number().positive().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("a11y", { ...args, check: args.check ?? "all" }, 300_000));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "analyze_design",
+  "Usage statistics for the live canvas via the plugin (scope: nodeId → " +
+    "selection → current page): top solid fill colors, top typography " +
+    "combos (family/style/size), and top auto-layout gaps + paddings, each " +
+    "with usage counts. Use it to spot hard-coded values that should be " +
+    "tokens, or to derive a palette from an existing design.",
+  {
+    kind: z.enum(["colors", "typography", "spacing", "all"]).optional(),
+    nodeId: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("analyze", { ...args, kind: args.kind ?? "all" }, 300_000));
+    } catch (err) {
+      return toolError(err);
+    }
+  }
+);
+
+server.tool(
+  "dev_resources",
+  "Manage dev resources (links to Storybook / GitHub / docs) on a node via " +
+    "the plugin: action='add' {url, name?}, 'list', or 'delete' {url}. " +
+    "Targets nodeId or the current selection.",
+  {
+    action: z.enum(["add", "list", "delete"]).optional(),
+    nodeId: z.string().optional(),
+    url: z.string().optional(),
+    name: z.string().optional(),
+  },
+  async (args) => {
+    try {
+      return jsonResult(await bridgeNodeOp("devResources", { ...args, action: args.action ?? "list" }));
     } catch (err) {
       return toolError(err);
     }

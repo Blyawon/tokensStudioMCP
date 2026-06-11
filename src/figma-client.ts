@@ -12,6 +12,40 @@ export interface FigmaNode {
   characters?: string;
   children?: FigmaNode[];
   sharedPluginData?: Record<string, Record<string, string>>;
+  // Layout / visual metadata Figma's REST API returns by default. Typed so
+  // the design-context renderer can surface them — these are what lets an
+  // agent rebuild a component without a second Figma MCP.
+  layoutMode?: "NONE" | "HORIZONTAL" | "VERTICAL";
+  itemSpacing?: number;
+  paddingTop?: number;
+  paddingRight?: number;
+  paddingBottom?: number;
+  paddingLeft?: number;
+  primaryAxisSizingMode?: string;
+  counterAxisSizingMode?: string;
+  primaryAxisAlignItems?: string;
+  counterAxisAlignItems?: string;
+  layoutSizingHorizontal?: string;
+  layoutSizingVertical?: string;
+  layoutWrap?: string;
+  layoutGrow?: number;
+  layoutPositioning?: string;
+  constraints?: { horizontal?: string; vertical?: string };
+  fills?: unknown[];
+  strokes?: unknown[];
+  strokeWeight?: number;
+  strokeAlign?: string;
+  effects?: unknown[];
+  cornerRadius?: number;
+  rectangleCornerRadii?: number[];
+  opacity?: number;
+  blendMode?: string;
+  clipsContent?: boolean;
+  rotation?: number;
+  visible?: boolean;
+  componentId?: string;
+  componentProperties?: Record<string, unknown>;
+  style?: Record<string, unknown>;
   // Figma returns other properties we don't care about.
   [key: string]: unknown;
 }

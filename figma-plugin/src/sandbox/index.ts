@@ -41,6 +41,8 @@ import {
   sendSecretStatus,
 } from "./storage.js";
 import { opApplyVisualWrites } from "./visual-writes.js";
+import { opEvalCode } from "./eval.js";
+import { opNodeOp } from "./node-ops.js";
 
 // ---------------------------------------------------------------------------
 // UI initialization
@@ -69,12 +71,19 @@ function buildLiveTarget(): {
   // data that protocol schemas would reject downstream.
   const fileKey = figma.fileKey;
   if (!fileKey) return null;
-  const sel = figma.currentPage.selection;
-  const nodeId = sel.length > 0 ? sel[0].id : null;
-  const name = sel.length > 0 ? sel[0].name : figma.currentPage.name;
-  const nodeParam = nodeId ? `?node-id=${nodeId.replaceAll(":", "-")}` : "";
-  const url = `https://www.figma.com/design/${fileKey}/${encodeURIComponent(figma.root.name ?? "file")}${nodeParam}`;
-  return { fileKey, nodeId, name, url };
+  // In dynamic-page mode `figma.currentPage` access can throw transiently
+  // while Figma swaps pages — return null instead of crashing the
+  // selectionchange/currentpagechange listeners.
+  try {
+    const sel = figma.currentPage.selection;
+    const nodeId = sel.length > 0 ? sel[0].id : null;
+    const name = sel.length > 0 ? sel[0].name : figma.currentPage.name;
+    const nodeParam = nodeId ? `?node-id=${nodeId.replaceAll(":", "-")}` : "";
+    const url = `https://www.figma.com/design/${fileKey}/${encodeURIComponent(figma.root.name || "file")}${nodeParam}`;
+    return { fileKey, nodeId, name, url };
+  } catch {
+    return null;
+  }
 }
 
 function pushLiveTarget(): void {
@@ -187,6 +196,10 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
       return await opInspectBoundVariables(params);
     case "getLiveTarget":
       return { target: buildLiveTarget() };
+    case "evalCode":
+      return await opEvalCode(params);
+    case "nodeOp":
+      return await opNodeOp(params);
     default:
       throw new Error(
         `Bridge RPC "${method}" isn't implemented by this plugin build. ` +
@@ -201,6 +214,17 @@ async function dispatch(method: string, params: unknown): Promise<unknown> {
 // ---------------------------------------------------------------------------
 
 async function sendUndoLog(): Promise<void> {
+  try {
+    await sendUndoLogInner();
+  } catch (err) {
+    // clientStorage can fail (quota, transient) — surface instead of an
+    // unhandled rejection that kills the message handler silently.
+    figma.ui.postMessage({ type: "set-undo-log", entries: [] });
+    console.error("sendUndoLog failed:", err);
+  }
+}
+
+async function sendUndoLogInner(): Promise<void> {
   const indexRaw = await figma.clientStorage.getAsync(UNDO_INDEX_KEY);
   const index = Array.isArray(indexRaw) ? (indexRaw as string[]) : [];
   const records = await Promise.all(
@@ -385,10 +409,14 @@ figma.ui.onmessage = async (msg: unknown) => {
     return;
   }
 
-  if (tag === "request-undo-log") { sendUndoLog(); return; }
+  if (tag === "request-undo-log") { void sendUndoLog(); return; }
   if (tag === "revert-op") {
     const id = (msg as { id?: string }).id;
-    if (id) revertOp(id);
+    if (id) {
+      revertOp(id).catch((err) => {
+        figma.notify(`Revert failed: ${err instanceof Error ? err.message : String(err)}`, { error: true });
+      });
+    }
     return;
   }
 
@@ -408,12 +436,16 @@ figma.ui.onmessage = async (msg: unknown) => {
   }
 
   if (tag === "clear-undo-log") {
-    figma.clientStorage.getAsync(UNDO_INDEX_KEY).then(async (raw) => {
-      const index = Array.isArray(raw) ? (raw as string[]) : [];
-      for (const id of index) await figma.clientStorage.deleteAsync(UNDO_OP_PREFIX + id);
-      await figma.clientStorage.deleteAsync(UNDO_INDEX_KEY);
-      sendUndoLog();
-    });
+    figma.clientStorage.getAsync(UNDO_INDEX_KEY)
+      .then(async (raw) => {
+        const index = Array.isArray(raw) ? (raw as string[]) : [];
+        for (const id of index) await figma.clientStorage.deleteAsync(UNDO_OP_PREFIX + id);
+        await figma.clientStorage.deleteAsync(UNDO_INDEX_KEY);
+        await sendUndoLog();
+      })
+      .catch((err) => {
+        figma.notify(`Couldn't clear history: ${err instanceof Error ? err.message : String(err)}`, { error: true });
+      });
     return;
   }
 };

@@ -6,7 +6,7 @@
  */
 
 export const TOKENS_NAMESPACE = "tokens";
-export const PLUGIN_VERSION = "0.2.0";
+export const PLUGIN_VERSION = "0.3.0";
 
 /**
  * Node types we attempt to read tokens from and apply visual writes to.

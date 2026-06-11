@@ -7,7 +7,7 @@ Design token bridge between Figma (via Tokens Studio) and AI code generation. Du
 ```bash
 npm run build          # TypeScript → dist/
 npm run build:plugin   # Figma plugin → figma-plugin/dist/
-npm test               # Node test runner (86 tests)
+npm test               # Node test runner (188 tests)
 npm run dev            # tsx hot-reload (CLI)
 ```
 
@@ -42,7 +42,8 @@ npm run dev            # tsx hot-reload (CLI)
 |------|---------|
 | `index.ts` | Entry point: .env loading, CLI router, clipboard |
 | `cli-commands.ts` | All CLI subcommands (tree, tokens, coverage, node, config, setup, help) |
-| `mcp-server.ts` | MCP server + all 21 tool registrations + bridge handlers |
+| `mcp-server.ts` | MCP server + all 38 tool registrations + bridge handlers |
+| `design-context.ts` | Markdown design-context renderer (layout + visual + typography + tokens per node) |
 | `apply-theme.ts` | Theme orchestration: catalog → resolve → write dispatch |
 | `apply-remap.ts` | Token remap + variant bulk-apply |
 | `figma-helpers.ts` | Shared: Figma client, node loading, target resolution |
@@ -104,6 +105,8 @@ npm run dev            # tsx hot-reload (CLI)
 | `src/sandbox/storage.ts` | Storage config, secrets, prefs, remap application |
 | `src/sandbox/visual-writes.ts` | Batched visual writes, undo log, typography, shadow |
 | `src/sandbox/color.ts` | Color parsing (#hex, rgb, hsl), paint cache, numeric helpers |
+| `src/sandbox/eval.ts` | Sandboxed JS execution (`figma_eval`) with timeout + result sanitization |
+| `src/sandbox/node-ops.ts` | Structured canvas ops: create/edit nodes, actions, live tree, find, export, variables |
 
 ### Bridge Protocol (`src/bridge/`)
 
@@ -111,6 +114,31 @@ npm run dev            # tsx hot-reload (CLI)
 |------|---------|
 | `protocol.ts` | Zod-validated wire schemas (request/response/progress frames) |
 | `server.ts` | WebSocket server (singleton, localhost:3055, one plugin connection) |
+
+## Canvas Authoring (figma-cli parity)
+
+The bridge exposes two generic plugin methods — `evalCode` (arbitrary JS in
+the sandbox) and `nodeOp` (structured op dispatcher) — surfaced as MCP tools:
+`figma_eval`, `create_node` (recursive `children` builds whole trees),
+`set_node_properties`, `node_action`, `get_canvas_tree`, `find_nodes`,
+`export_node_image`, `figma_variables` (incl. exportCss/exportTailwind),
+`create_icon` (Iconify), `create_image_from_url`, `canvas_audit` (WCAG
+contrast/touch/text), `analyze_design` (color/typography/spacing usage),
+`dev_resources`. FigJam files get `sticky` / `connector` / `shape` node
+types. These operate on whatever file the plugin is open in (any tab,
+drafts included) — no REST key or fileKey needed. Adding a new structured
+op = one `case` in `node-ops.ts:opNodeOp`; no protocol change.
+
+## Agent-facing Output
+
+- `get_design_context` returns a compact markdown tree with full layout
+  metadata (auto-layout, constraints, fills/effects as hex, typography,
+  component props) + applied tokens — designed so agents can build
+  components from Figma without a second Figma MCP.
+- `get_metadata_with_tokens` accepts `format: "tree"` for a ~50% smaller
+  markdown tree instead of XML.
+- Big JSON payloads (catalog, working copy) are compact-printed; token
+  edit tools return a summary, not the full edit log.
 
 ## Key Design Decisions
 

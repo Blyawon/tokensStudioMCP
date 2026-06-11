@@ -25,9 +25,22 @@ export async function opEnumerateTokenizedNodes(params: unknown): Promise<unknow
     await figma.loadAllPagesAsync();
   }
 
-  let scopeDescription: string;
   const previousSkipFlag = figma.skipInvisibleInstanceChildren;
   if (skipHidden) figma.skipInvisibleInstanceChildren = true;
+  try {
+    return await enumerateInner(scope, skipHidden);
+  } finally {
+    // Restore even on error — this is a global flag; leaving it flipped
+    // changes the behavior of every later findAll/walk in the session.
+    figma.skipInvisibleInstanceChildren = previousSkipFlag;
+  }
+}
+
+async function enumerateInner(
+  scope: "currentPage" | "selection" | "document",
+  skipHidden: boolean
+): Promise<unknown> {
+  let scopeDescription: string;
 
   const out: Array<{
     id: string;
@@ -93,7 +106,6 @@ export async function opEnumerateTokenizedNodes(params: unknown): Promise<unknow
     }
   }
 
-  figma.skipInvisibleInstanceChildren = previousSkipFlag;
   return { nodes: out, scopeDescription };
 }
 

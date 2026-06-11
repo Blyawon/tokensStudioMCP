@@ -26,12 +26,28 @@ const APPLY_FINGERPRINT_CACHE = new Map<string, ApplyThemeResult>();
 const FINGERPRINT_TTL_MS = 5 * 60_000;
 const FINGERPRINT_TIMES = new Map<string, number>();
 
+// Identity counter per catalog `values` object. A refetched catalog (TTL
+// expiry, invalidation, external push) is a NEW object → new generation →
+// fingerprint cache miss. Fixes re-applies of a theme returning stale cached
+// results after the underlying token values changed upstream.
+const CATALOG_GENERATION = new WeakMap<object, number>();
+let NEXT_CATALOG_GENERATION = 1;
+function catalogGeneration(values: object): number {
+  let g = CATALOG_GENERATION.get(values);
+  if (g === undefined) {
+    g = NEXT_CATALOG_GENERATION++;
+    CATALOG_GENERATION.set(values, g);
+  }
+  return g;
+}
+
 function fingerprintApply(
   themeName: string,
   nodes: Array<{ id: string; tokens: Record<string, string> }>,
-  catalogSource?: { provider: string; description: string }
+  catalogSource: { provider: string; description: string } | undefined,
+  generation: number
 ): string {
-  const parts = [themeName, catalogSource?.provider ?? "", catalogSource?.description ?? ""];
+  const parts = [themeName, String(generation), catalogSource?.provider ?? "", catalogSource?.description ?? ""];
   const sortedNodes = [...nodes].sort((a, b) => a.id < b.id ? -1 : 1);
   for (const n of sortedNodes) {
     parts.push(n.id);
@@ -66,6 +82,40 @@ function rememberFingerprint(key: string, result: ApplyThemeResult): void {
 export function clearFingerprintCache(): void {
   APPLY_FINGERPRINT_CACHE.clear();
   FINGERPRINT_TIMES.clear();
+}
+
+// --------------------------------------------------------------------------
+// Resolver memoization — flattening a large catalog into the token index is
+// O(token count) and used to run on EVERY apply. Cache per catalog `values`
+// object (the catalog cache returns the same object within its TTL) keyed by
+// the theme's set signature, so re-applies and theme A/B switches skip the
+// rebuild entirely.
+// --------------------------------------------------------------------------
+
+type Resolver = ReturnType<typeof makeResolver>;
+const RESOLVER_CACHE = new WeakMap<object, Map<string, Resolver>>();
+const RESOLVER_CACHE_MAX_PER_CATALOG = 8;
+
+function getMemoizedResolver(
+  values: Record<string, unknown>,
+  enabledSets: string[],
+  selectedTokenSets: Record<string, string>
+): Resolver {
+  const key = JSON.stringify([enabledSets, selectedTokenSets]);
+  let perCatalog = RESOLVER_CACHE.get(values);
+  if (!perCatalog) {
+    perCatalog = new Map();
+    RESOLVER_CACHE.set(values, perCatalog);
+  }
+  const hit = perCatalog.get(key);
+  if (hit) return hit;
+  const resolver = makeResolver(values, enabledSets, selectedTokenSets);
+  if (perCatalog.size >= RESOLVER_CACHE_MAX_PER_CATALOG) {
+    const oldest = perCatalog.keys().next().value;
+    if (oldest !== undefined) perCatalog.delete(oldest);
+  }
+  perCatalog.set(key, resolver);
+  return resolver;
 }
 
 // --------------------------------------------------------------------------
@@ -336,9 +386,12 @@ export async function applyTheme(
     });
   }
 
-  const { resolve, resolveInline } = makeResolver(values, enabledSets, selectedTokenSets);
-
-  // 3. Set the active theme on the file.
+  // 3 + 4 run concurrently with the resolver build: the plugin round-trips
+  // (setActiveTheme write + full-document enumeration walk) are I/O-bound in
+  // the sandbox, while flattening the catalog into the token index is
+  // CPU-bound here. Kicking the bridge requests off FIRST means the sandbox
+  // walks the document while we build (or fetch the memoized) resolver,
+  // instead of the two phases running back-to-back.
   const bridge = getBridge();
   if (!bridge.isConnected()) {
     throw new Error(
@@ -347,27 +400,19 @@ export async function applyTheme(
   }
   const themeId = (theme as { id?: string }).id;
   const themeGroup = (theme as { group?: string }).group ?? "";
-  let previousActiveTheme: string | null = null;
-  let previousUsedTokenSet: string | null = null;
-  if (!opts.dryRun && opts.setActive) {
-    const r = (await bridge.request("setActiveTheme", {
-      themeName: opts.themeName,
-      themeId,
-      themeGroup,
-      enabledSets,
-      selectedTokenSets,
-    })) as {
-      previousActiveTheme: string | null;
-      previousUsedTokenSet: string | null;
-    };
-    previousActiveTheme = r.previousActiveTheme ?? null;
-    previousUsedTokenSet = r.previousUsedTokenSet ?? null;
-  }
 
-  // 4. Find nodes with applied tokens.
-  const nodesWithTokens: Array<{ id: string; tokens: Record<string, string> }> = [];
-  let scanned = 0;
-  let scopeDescription: string;
+  const setActivePromise: Promise<{
+    previousActiveTheme?: string | null;
+    previousUsedTokenSet?: string | null;
+  } | null> = (!opts.dryRun && opts.setActive)
+    ? (bridge.request("setActiveTheme", {
+        themeName: opts.themeName,
+        themeId,
+        themeGroup,
+        enabledSets,
+        selectedTokenSets,
+      }) as Promise<{ previousActiveTheme?: string | null; previousUsedTokenSet?: string | null }>)
+    : Promise.resolve(null);
 
   const usePlugin =
     opts.scope === "currentPage" ||
@@ -375,16 +420,39 @@ export async function applyTheme(
     opts.scope === "document" ||
     (opts.scope === "auto" && !target.fileKey);
 
+  const enumPromise = usePlugin
+    ? (bridge.request("enumerateTokenizedNodes", {
+        scope: opts.scope === "auto" ? "currentPage" : opts.scope,
+        skipHidden: opts.skipHidden,
+      }, { timeoutMs: 3_600_000 }) as Promise<{
+        nodes: Array<{ id: string; name: string; type: string; tokens: Record<string, string>; locked?: boolean }>;
+        scopeDescription: string;
+      }>)
+    : null;
+  const restRootPromise = usePlugin ? null : loadNode(getClient(), target);
+
+  // Shadow handlers: if setActivePromise rejects while these are still
+  // in-flight, their own (later) rejection would otherwise be unhandled —
+  // which crashes Node under the default --unhandled-rejections=throw.
+  // The no-op catch marks the rejection handled; the real `await` below
+  // still observes (and rethrows) it.
+  enumPromise?.catch(() => {});
+  restRootPromise?.catch(() => {});
+
+  const { resolve, resolveInline } = getMemoizedResolver(values, enabledSets, selectedTokenSets);
+
+  const setActiveResult = await setActivePromise;
+  const previousActiveTheme = setActiveResult?.previousActiveTheme ?? null;
+  const previousUsedTokenSet = setActiveResult?.previousUsedTokenSet ?? null;
+
+  // Collect nodes with applied tokens from whichever source we started.
+  const nodesWithTokens: Array<{ id: string; tokens: Record<string, string> }> = [];
+  let scanned = 0;
+  let scopeDescription: string;
+
   let lockedSkipped = 0;
-  if (usePlugin) {
-    const pluginScope = opts.scope === "auto" ? "currentPage" : opts.scope;
-    const enumResult = (await bridge.request("enumerateTokenizedNodes", {
-      scope: pluginScope,
-      skipHidden: opts.skipHidden,
-    }, { timeoutMs: 3_600_000 })) as {
-      nodes: Array<{ id: string; name: string; type: string; tokens: Record<string, string>; locked?: boolean }>;
-      scopeDescription: string;
-    };
+  if (enumPromise) {
+    const enumResult = await enumPromise;
     for (const n of enumResult.nodes) {
       // Pre-filter locked nodes so we don't generate writes the plugin will
       // have to reject one-by-one. Counted separately from write-level skips
@@ -398,8 +466,7 @@ export async function applyTheme(
     scanned = enumResult.nodes.length;
     scopeDescription = enumResult.scopeDescription;
   } else {
-    const client = getClient();
-    const root = await loadNode(client, target);
+    const root = await restRootPromise!;
     walkVisible(root, opts.skipHidden, (n) => {
       scanned += 1;
       // Include composition tokens — they're how Tokens Studio bundles
@@ -416,7 +483,9 @@ export async function applyTheme(
   }
 
   // PERF: re-apply short-circuit.
-  const fingerprintKey = fingerprintApply(opts.themeName, nodesWithTokens, catalog.source);
+  const fingerprintKey = fingerprintApply(
+    opts.themeName, nodesWithTokens, catalog.source, catalogGeneration(values)
+  );
   if (opts.setActive && !opts.dryRun) {
     const cached = lookupFingerprintCache(fingerprintKey);
     if (cached) {
